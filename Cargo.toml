@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cloud-ui-core",
+    "crates/cloud-ui-types",
+    "crates/cloudime-render",
+    "crates/cloud-ui",
+]
+
+[workspace.package]
+version = "0.0.3"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.dependencies]
+# 内部 crate
+cloud-ui-core = { path = "crates/cloud-ui-core" }
+cloud-ui-types = { path = "crates/cloud-ui-types" }
+cloudime-render = { path = "crates/cloudime-render" }
+
+# 外部依赖统一在这里定版本，子 crate 只写 `xxx.workspace = true`
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
+
+# 渲染器
+tiny-skia = "0.12.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp"] }
+resvg = { version = "0.48.1", default-features = false }
+cosmic-text = { version = "0.19.0", default-features = false, features = ["std", "swash"] }
+i_overlay = "9.1.0"
+
+# Windows 平台
+windows = "0.62.2"
+windows-core = "0.62.2"
+
+# cosmic-text 的 opsz 光学字号支持；上游收了就删掉这段回 crates.io。
+[patch.crates-io]
+cosmic-text = { git = "https://github.com/qingjian-team/cosmic-text", rev = "9cf0d65a5e4db381e34907103326673386096be3" }

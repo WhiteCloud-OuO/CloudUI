@@ -1,0 +1,1286 @@
+//! 辅助窗口：挂在某个**独立窗口**上的辅助信息 / 提示窗口 —— 它是那块独立窗口的**资产**（asset）。
+//!
+//! 规矩见 `docs/design/windows.md`（摘要如下）：
+//!
+//! - **所有者唯一且不转移**：每个辅助窗口**有且只有一个所有者**（它的宿主独立窗口），
+//!   所有权在它整个生命周期里**不移交、也不被直接借用** —— 它就一直待在宿主的 [`Assets`] 里
+//!   （那里只有「收进来」与「放掉」，没有「取出来」的口子）。
+//! - **只能经桥接跟所有者打交道**：辅助窗口**不能**直接跟别的辅助窗口、或不是它所有者的独立窗口通讯；
+//!   要几何、要开关、要内容都得**委托所有者**去办 —— 这条委托路叫**桥接**（bridging），
+//!   就是 [`Bridge`]：所有权在宿主手里，每次驱动资产时把 `&dyn Bridge` 借给它用一下。
+//! - **生命周期始终绑定**到宿主：宿主创建**之后**才有它，宿主销毁**之前**先放掉它
+//!   （所以宿主 `Drop` 的第一件事是 [`Assets::retire`]，之后才 `DestroyWindow` 自己那块窗）；
+//! - 内容也由宿主转达（宿主要换资产的内容 / 版面，都经 [`Asset`] 的接口落到资产上）。
+//! - **焦点**（[`Focus`]）属于**一组**（所有者 + 它名下的资产），一组里**任何时刻恰好一个**持有者：
+//!   缺省在所有者身上（独立窗口创建并显示后总是具备焦点）；所有者可以把它**指定**给某件声明了
+//!   [`Asset::able_to_get_focus`] 的资产（[`DesignatedAssetToGetFocus`]）—— 那之后由那件资产
+//!   响应鼠标 / 键盘，所有者不再接受。**所有辅助窗口默认不具备焦点**（鼠标一律穿透、点不着）。
+//!   两件**同一所有者**的辅助窗口之间转移焦点也要**经桥接**（走 [`Bridge::designate_focus`]，
+//!   资产之间不直接通讯，见 §3），指认目标用 [`Asset::name`]。
+//! - 术语：把自己的焦点**转移给另一个窗口**的过程叫**失焦**（unfocusing），**获得**焦点的过程叫
+//!   **聚焦**（focusing）—— 资产收 [`Asset::focusing`] / [`Asset::unfocusing`]，所有者收
+//!   [`DesignatedAssetToGetFocus::focusing`] / [`DesignatedAssetToGetFocus::unfocusing`]。
+//!
+//! 眼下使用这套机制的是挂在独立窗口上的普通辅助窗口与内置对话框 —— 前者缺省**没**声明
+//! `able_to_get_focus`，所以整组一直由所有者持有焦点。
+//!
+//! ⚠️ 「**资产克隆**」与「**资产窃取**」（别的独立窗口来克隆本窗口的资产、克隆完把原件销毁）也写在
+//! `docs/design/windows.md` §5 —— **暂时用不上**，先把规则定下来（将来要加的是一个
+//! 「可克隆」trait，比如 `Clonable: Asset`）。
+
+use std::cell::{Cell, RefCell};
+
+use windows::Win32::Foundation::RECT;
+
+use cloud_ui_types::LayoutMode;
+
+/// 宿主独立窗口喂给资产的那点信息：宿主的**内容区**屏幕矩形、排布方向、是不是展开着（Tab）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Host {
+    /// 宿主内容区的屏幕矩形；宿主没显示时为 `None`（资产这时该收起）。
+    pub rect: Option<RECT>,
+
+    /// 宿主的排布方向：资产按它决定贴宿主右侧（竖排）还是下方（横排）。
+    pub layout: LayoutMode,
+
+    /// 宿主是不是展开着（候选窗的 Tab「更多候选项」）：展开时资产让位。
+    pub expanded: bool,
+}
+
+/// **焦点**（focus）在谁身上 —— 「让窗口具备响应键盘 / 鼠标的功能」的那个特性。
+///
+/// 焦点属于**一组**（一个独立窗口 + 它名下的资产），一组里同时只有**一个**持有者：
+///
+/// - 缺省在**所有者**（独立窗口）身上 —— 独立窗口创建并显示后总是具备焦点；
+/// - 所有者可以把它**指定**给某件资产（[`Assets::designate_focus`]）；那件资产必须先在创建时
+///   声明 [`Asset::able_to_get_focus`]，否则接不住；
+/// - 指定之后由那件资产响应鼠标 / 键盘，**原所有者不再接受**；
+/// - 归还三条路（[`Assets::return_focus_to_owner`]）：所有者主动收回、那件资产**收起**（[`Assets::hide`]）、
+///   它走到**生命周期末**（[`Assets::retire`]）—— 后两条都**自动**触发。
+///
+/// ⚠️ 这是**逻辑焦点**，不是 Win32 的 `SetFocus`：咱们的窗口全是 `WS_EX_NOACTIVATE`，
+/// 真去抢系统焦点会把用户正在打字的那个应用弄丢。落地上「具备焦点」= 这一组里**由谁接受输入**：
+/// 没有焦点的一方鼠标一律**穿透**（点不着），键也轮不到它。
+// 第一轮只落机制：还没有谁来**指定**焦点，所以 `Focus::Asset` 这个变体眼下没被生产代码构造（测试里有）。
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    /// 在所有者（独立窗口）身上。
+    #[default]
+    Owner,
+
+    /// 已经指定给名下的第几件资产（[`Assets`] 里的下标）。
+    Asset(usize),
+}
+
+/// **指定资产获取焦点**（`designated_asset_to_get_focus`）：**独立窗口都实现它**（由
+/// [`super::independent_window_template::IndependentWindowTemplate`] 统一实现，所以每块独立窗口都有）。
+///
+/// 这是**所有者**那一侧的特权：把焦点从自己身上指定给名下某件资产，或者把它收回来。
+/// 资产自己说了不算 —— 声明了 [`Asset::able_to_get_focus`] 也只是「能」接，真拿到要所有者指定。
+// 第一轮只落机制：还没有谁来调它（后续部分接入「谁在什么时候指定焦点」时会用上）。
+#[allow(dead_code)]
+pub trait DesignatedAssetToGetFocus {
+    /// 把焦点**指定**给名下叫 `name` 的那件资产（`designated_asset_to_get_focus`）。
+    /// `false` = 没动 —— 没这个名字、那件没声明 [`Asset::able_to_get_focus`]、或者焦点本来就在它手上。
+    fn designate_focus(&self, name: &str) -> bool;
+
+    /// 让焦点**归还给所有者**（`return_focus_to_owner`）。`false` = 没动（焦点本来就在所有者手上）。
+    fn return_focus_to_owner(&self) -> bool;
+
+    /// 这一组的焦点这会儿在谁身上。
+    fn focus(&self) -> Focus;
+
+    /// **聚焦**：焦点落到自己（所有者）身上了 —— 轮到自己响应鼠标 / 键盘。
+    fn focusing(&self) {}
+
+    /// **失焦**：自己把焦点**转移出去了**（指定给了名下某件资产）—— 不再接受鼠标 / 键盘。
+    fn unfocusing(&self) {}
+}
+
+pub use crate::auxiliary_window_template::AssetKind;
+
+/// **桥接**（bridging）：辅助窗口**委托它的所有者**去办事的那条路。
+///
+/// 规矩：辅助窗口**不能**直接跟别的辅助窗口、也不能跟不是它所有者的独立窗口通讯 ——
+/// 要几何、要开关、要内容，都得委托所有者。这个 trait 由**所有者**（宿主独立窗口）实现，
+/// 每次驱动资产时把 `&dyn Bridge` **借**给它用一下（所有权仍在宿主手里，不转移）。
+pub trait Bridge {
+    /// 宿主（所有者）自己的形状：内容区屏幕矩形 / 排布方向 / 是不是展开着。
+    fn host(&self) -> Host;
+
+    /// 这件资产这会儿开着没有（用户按 `Ctrl+F1` 之类切的）。
+    fn asset_on(&self) -> bool;
+
+    /// 请所有者把焦点**指定**给名下叫 `name` 的那件资产 —— **同一所有者的两件辅助窗口之间转移焦点
+    /// 只能走这条**（资产之间不直接通讯，见 §3）。`false` = 没动（没这件 / 它接不住 / 本来就在它手上）。
+    // 机制已就位：还没有哪件资产自己要求转手（后续部分接入触发时会用上）。
+    #[allow(dead_code)]
+    fn designate_focus(&self, name: &str) -> bool;
+
+    /// 焦点**交还给所有者**：辅助窗口自己要把焦点放回去时走这条。
+    /// 收起与生命周期末那两条由资产表**自动**走（[`Assets::hide`] / [`Assets::retire`]），资产不用操心。
+    // 机制已就位：还没有哪件资产自己要求归还（自动归还那条已经在走）。
+    #[allow(dead_code)]
+    fn return_focus_to_owner(&self);
+
+    /// 所有者当前的蒙版（`None` = 没有）。对话框要求开蒙版时先记下它，销毁时恢复。
+    fn mask(&self) -> Option<crate::WindowMask> {
+        None
+    }
+
+    /// 让所有者开 / 关蒙版。仅内置对话框（[`AssetKind::Dialog`]）会调；普通辅助窗口不碰。
+    fn set_mask(&self, _mask: Option<crate::WindowMask>) {}
+}
+
+/// 非法取消 dialog 的模态：按需求走**异常终止**，不 unwind、不抛 panic。
+fn abort_dialog_modal_cancel(name: &str) -> ! {
+    tracing::error!(
+        asset = name,
+        "dialog 在生命周期内不能取消模态（set_modal(false)），程序将异常终止"
+    );
+    std::process::abort();
+}
+
+/// 一份「辅助窗口」资产：由宿主独立窗口创建与销毁。
+///
+/// **所有者唯一且不转移**：谁建的谁就是它唯一的所有者，之后一直待在宿主的 [`Assets`] 里；
+/// 它够得着的只有宿主每次经桥接交过来的 [`Bridge`]。
+pub trait Asset {
+    /// 这件资产的**名字**：同一所有者的名下**不许重名**（[`Assets::add`] 里 `debug_assert` 盯着）。
+    /// 跨资产指认（[`Bridge::designate_focus`]）与日志用它 —— 名字要**稳定**，加 / 删别的资产不影响它。
+    /// 脚本建的资产名字是运行期起的（`format!("script-{id}")`），所以返回借来的 `&str`。
+    fn name(&self) -> &str;
+
+    /// 资产种类；缺省是普通辅助窗口。内置对话框覆盖成 [`AssetKind::Dialog`]。
+    fn kind(&self) -> AssetKind {
+        AssetKind::Auxiliary
+    }
+
+    /// 生命周期末的清理钩子（在 [`Assets::retire_named`] 放掉它之前，由所有者带桥接调）：
+    /// 对话框在这里恢复创建前的蒙版；普通资产不用实现。
+    fn detach(&self, _owner: &dyn Bridge) {}
+
+    /// 宿主贴出一帧 / 开关变了之后调：要什么（几何、开关…）都经 `owner` 要，再把自己摆好。
+    ///
+    /// `owner` 就是它的所有者（宿主那一块独立窗口），而所有者**只借**这一下。
+    fn sync(&self, owner: &dyn Bridge);
+
+    /// 收起（宿主收起、或销毁之前）。
+    fn hide(&self);
+
+    /// **模态**（modal）：把这件辅助窗口设为 / 取消模态（`set_modal(true/false)`）。
+    ///
+    /// 模态只属于辅助窗口：设为模态后，它的**所有者**暂时不再接受鼠标 / 键盘（事件响应被屏蔽），
+    /// 但所有者仍然活着 —— 桥接、[`Self::sync`]、内容更新照旧；模态窗口在屏幕上始终排在所有者上层。
+    ///
+    /// 同一所有者名下同一时刻只允许**一件**模态资产，由 [`Assets::set_modal`] 统一仲裁：
+    /// 它先确认没有别的模态资产，再调到这里。
+    fn set_modal(&self, _modal: bool) {}
+
+    /// 把模态窗口提到最前（所有者可能又显示 / 抬起了别的窗口，比如脚本的 RichEdit 宿主）。
+    fn raise(&self) {}
+
+    /// 这件资产**允许被别的独立窗口克隆**时返回自己（实现 [`Clonable`] 的资产覆盖它）。
+    ///
+    /// 缺省 `None` = 不可克隆。克隆 / 窃取的来源侧入口（[`Assets::clone_asset`] /
+    /// [`Assets::steal_asset`]）先查它；**模态资产在查它之前就 panic**。
+    fn as_clonable(&self) -> Option<&dyn Clonable> {
+        None
+    }
+
+    /// 创建时声明自己**允不允许获取焦点**（`able_to_get_focus`）：`false`（缺省）= **不具备焦点** ——
+    /// 鼠标 / 键盘一律不响应（所有辅助窗口默认如此）。允许也只是「能」，真拿到还要所有者**指定**
+    /// （[`DesignatedAssetToGetFocus`]）。
+    fn able_to_get_focus(&self) -> bool {
+        false
+    }
+
+    /// **聚焦**：所有者把焦点**指定**给它了 —— 从此由它响应鼠标 / 键盘（原所有者不再接受）。
+    fn focusing(&self) {}
+
+    /// **失焦**：它把自己的焦点**转移出去**了（交还给所有者、转给同一所有者名下的另一件资产，
+    /// 或者收起 / 生命周期末的**自动归还**）—— 把响应输入的那些开关关掉。
+    fn unfocusing(&self) {}
+}
+
+/// 允许被别的独立窗口**克隆**的资产额外实现它（`docs/design/windows.md` §5.1）。
+///
+/// 资产除了 [`Asset`] 还要实现本 trait，并在 `Asset::as_clonable` 里返回 `Some(self)`；
+/// 所有者一侧的 [`Assets::clone_asset`] / [`Assets::steal_asset`] 才会取到它。
+pub trait Clonable: Asset {
+    /// 克隆一份「除所有者以外」都一样的自己；克隆件由**请求方**持有、所有者是请求方。
+    fn clone_asset(&self) -> Box<dyn Asset>;
+}
+
+/// 一个独立窗口名下的全部资产 + 这一组的**焦点**。
+///
+/// **所有权**：资产由宿主创建、存这里，**不移交也不借出去** —— 这个类型只有「收进来」（[`Self::add`]）
+/// 与「放掉」（[`Self::retire`]），没有「取出来」的口子；宿主跟资产之间只有 [`Self::sync`]
+/// 这条**桥接**路（[`Self::sync`] 把自己作为 [`Bridge`] 借给它们用一下）。
+///
+/// **顺序**：宿主先建好自己那块窗，再 [`Self::add`]；销毁时 `Drop` 的第一件事是
+/// [`Self::retire`]（在 `DestroyWindow` 自己之前）—— 资产的寿命就落在这段区间里。
+///
+/// **焦点**（[`Focus`]）：这一组的成员里**任何时刻恰好一个**持有者，缺省是**所有者**自己；所有者可以把焦点
+/// **指定**给某件声明了 [`Asset::able_to_get_focus`] 的资产（[`Self::designate_focus`]，按 [`Asset::name`] 认）。
+/// 归还三条路：所有者主动收回（[`Self::return_focus_to_owner`]）、那件资产**收起**（[`Self::hide`]）、它走到
+/// **生命周期末**（[`Self::retire`]）—— 后两条**自动**走一遍归还，焦点不会落在一件看不见、或者马上就
+/// 没了的东西上。
+///
+/// 模态栈里的一项；只有**栈顶**是当前生效的模态，下面的项被 dialog 临时挂起。
+#[derive(Debug, Clone, Copy)]
+struct ModalEntry {
+    /// 资产在 [`Assets::items`] 里的下标。
+    index: usize,
+
+    /// 是不是内置对话框（生命周期内不可取消模态）。
+    dialog: bool,
+
+    /// 当前是否生效；被更上层的 dialog 压住时是 `false`。
+    active: bool,
+}
+
+#[derive(Default)]
+pub struct Assets {
+    /// 名下的资产（[`Focus::Asset`] 里的下标就是这儿的顺序）。
+    items: Vec<Box<dyn Asset>>,
+
+    /// 这一组的焦点在谁身上（缺省在所有者身上）。
+    focus: Cell<Focus>,
+
+    /// 模态栈：栈底是较早的模态资产，栈顶是当前生效的那个。空 = 没有模态。
+    ///
+    /// 同一时刻只有栈顶 `active`；创建 dialog 时把原来的栈顶挂起（`active = false`），
+    /// dialog 销毁后再恢复它。普通模态资产只允许栈里有一项。
+    modal: RefCell<Vec<ModalEntry>>,
+}
+
+impl Assets {
+    /// 收下一份资产（所有权就落在这儿了）。**必须**在宿主自己那块窗建好之后调。
+    ///
+    /// **不动焦点**：新收进来的资产哪怕声明了 [`Asset::able_to_get_focus`]，也**不会自己拿到焦点** ——
+    /// 焦点还在原持有者（所有者、或者同一所有者名下的某件姊妹资产）身上，要它拿还是得所有者**指定**
+    /// （`docs/design/windows.md` §4 规则 8）。**资产克隆与资产窃取**都是这条：克隆件 / 窃取件进来时一样，
+    /// 特性照旧、焦点不动。
+    ///
+    /// 名字重了在 debug 下直接叫出来 —— [`Self::designate_focus`] 按名字指认，重名就指不准了。
+    pub fn add(&mut self, asset: Box<dyn Asset>) {
+        debug_assert!(
+            self.index_of(asset.name()).is_none(),
+            "同一所有者名下的资产重名：{}",
+            asset.name()
+        );
+        let kind = asset.kind();
+        self.items.push(asset);
+        if kind == AssetKind::Dialog {
+            // dialog 创建即强制模态：先挂起当前模态，再把 dialog 压到栈顶。
+            let index = self.items.len() - 1;
+            self.activate_dialog(index);
+        }
+    }
+
+    /// 这一组的焦点在谁身上。
+    pub fn focus(&self) -> Focus {
+        self.focus.get()
+    }
+
+    /// 焦点这会儿是不是在叫 `name` 的那件资产身上（脚本收起它时用：先归还再收起）。
+    pub fn focused_name_is(&self, name: &str) -> bool {
+        match self.focus.get() {
+            Focus::Asset(index) => self
+                .items
+                .get(index)
+                .is_some_and(|asset| asset.name() == name),
+            Focus::Owner => false,
+        }
+    }
+
+    /// 把焦点**指定**给名下叫 `name` 的那件资产（`designated_asset_to_get_focus`）。
+    /// `false` = 没动 —— 没这个名字、那件没声明 [`Asset::able_to_get_focus`]、或者焦点本来就在它手上。
+    // 机制已就位：还没有谁来主动指定（后续部分接入触发时会用上；归还那条已经在走）。
+    #[allow(dead_code)]
+    pub fn designate_focus(&self, name: &str) -> bool {
+        let Some(index) = self.index_of(name) else {
+            return false;
+        };
+        let target = Focus::Asset(index);
+        self.allows(target) && self.move_focus(target)
+    }
+
+    /// 让焦点**归还给所有者**（`return_focus_to_owner`）。`false` = 没动（本来就在所有者手上）。
+    pub fn return_focus_to_owner(&self) -> bool {
+        self.move_focus(Focus::Owner)
+    }
+
+    /// 这一组当前生效的**模态资产**名字；`None` = 没有模态。
+    pub fn modal(&self) -> Option<&str> {
+        let entry = *self.modal.borrow().last()?;
+        self.items.get(entry.index).map(|asset| asset.name())
+    }
+
+    /// 设置 / 取消名下叫 `name` 的那件资产的**模态**。
+    ///
+    /// - 普通资产：同一时刻只允许一件；已有模态（包括 dialog）时再设另一件直接失败；
+    /// - dialog：由 [`Self::add`] 自动压入栈顶，不能通过这里取消；对 dialog 调 `modal = false`
+    ///   会直接**异常终止程序**（不是 unwind panic）；
+    /// - 名字不存在、状态本来就是这样、或者另一件资产正模态 —— 都返回 `false`。
+    ///
+    /// 模态**只随资产销毁自动取消**（[`Self::retire`] / [`Self::retire_named`]）；收起
+    /// （[`Self::hide`]）不改模态状态，窗口再显示时模态还在。
+    pub fn set_modal(&self, name: &str, modal: bool) -> bool {
+        let Some(index) = self.index_of(name) else {
+            return false;
+        };
+        if modal {
+            if !self.modal.borrow().is_empty() {
+                return false;
+            }
+            self.modal.borrow_mut().push(ModalEntry {
+                index,
+                dialog: self.items[index].kind() == AssetKind::Dialog,
+                active: true,
+            });
+            self.items[index].set_modal(true);
+            tracing::debug!(asset = name, "辅助窗口进入模态");
+            true
+        } else {
+            let entry = {
+                let mut stack = self.modal.borrow_mut();
+                let Some(position) = stack.iter().position(|entry| entry.index == index) else {
+                    return false;
+                };
+                if stack[position].dialog {
+                    // dialog 生命周期内不能取消模态：按需求走异常终止，不是 panic。
+                    drop(stack);
+                    abort_dialog_modal_cancel(name);
+                }
+                stack.remove(position)
+            };
+            // 被移除的若是栈顶，先收回它的模态，再把下一个（更早的）模态恢复。
+            let reactivate = entry.active;
+            if reactivate {
+                self.items[index].set_modal(false);
+                self.activate_top();
+            } else {
+                // 被 dialog 挂起的普通资产：它本来就已经 set_modal(false) 了。
+                self.items[index].set_modal(false);
+            }
+            tracing::debug!(asset = name, "辅助窗口取消模态");
+            true
+        }
+    }
+
+    /// 把当前的模态资产重新提到最前（所有者又抬了别的窗口时用）。
+    pub fn raise_modal(&self) {
+        let index = self.modal.borrow().last().map(|entry| entry.index);
+        if let Some(index) = index
+            && let Some(asset) = self.items.get(index)
+        {
+            asset.raise();
+        }
+    }
+
+    /// 当前生效的模态是不是 dialog。
+    pub fn modal_is_dialog(&self) -> bool {
+        self.modal.borrow().last().is_some_and(|entry| entry.dialog)
+    }
+
+    /// dialog 进栈：挂起当前栈顶，把 dialog 压到栈顶，并把焦点从别的资产转给它。
+    fn activate_dialog(&mut self, index: usize) {
+        self.suspend_top();
+        self.modal.borrow_mut().push(ModalEntry {
+            index,
+            dialog: true,
+            active: true,
+        });
+        self.items[index].set_modal(true);
+        let name = self.items[index].name().to_owned();
+        // 规则：焦点在别的资产身上时，先让它经桥接把焦点交还所有者，再由所有者指定给 dialog。
+        if matches!(self.focus.get(), Focus::Asset(held) if held != index) {
+            self.return_focus_to_owner();
+        }
+        if self.items[index].able_to_get_focus() {
+            self.designate_focus(&name);
+        }
+        tracing::debug!(asset = %name, "对话框进入模态");
+    }
+
+    /// 把当前栈顶挂起（`set_modal(false)`），但保留它在栈里的位置。
+    fn suspend_top(&self) {
+        let index = {
+            let mut stack = self.modal.borrow_mut();
+            match stack.last_mut() {
+                Some(top) if top.active => {
+                    top.active = false;
+                    Some(top.index)
+                }
+                _ => None,
+            }
+        };
+        if let Some(index) = index
+            && let Some(asset) = self.items.get(index)
+        {
+            asset.set_modal(false);
+        }
+    }
+
+    /// 恢复当前栈顶（如果它被挂起）。
+    fn activate_top(&self) {
+        let index = {
+            let mut stack = self.modal.borrow_mut();
+            match stack.last_mut() {
+                Some(top) if !top.active => {
+                    top.active = true;
+                    Some(top.index)
+                }
+                _ => None,
+            }
+        };
+        if let Some(index) = index
+            && let Some(asset) = self.items.get(index)
+        {
+            asset.set_modal(true);
+        }
+    }
+
+    /// 克隆 / 窃取**来源侧**的硬检查：`name` 是模态资产（含被 dialog 临时挂起的）时直接 panic。
+    ///
+    /// 模态窗口属于它的所有者，不能离开；克隆 / 窃取走到这里说明调用方违反了这条硬规则。
+    /// 这里故意 panic 而不是静默返回失败 —— 否则请求方会以为已经拿到了副本。
+    ///
+    /// 名字不存在、或者不是模态：什么都不做（能不能克隆由 [`Asset::as_clonable`] 决定）。
+    ///
+    /// # Panics
+    ///
+    /// `name` 正处于模态栈里时 panic。
+    pub fn ensure_cloneable(&self, name: &str) {
+        let Some(index) = self.index_of(name) else {
+            return;
+        };
+        if self.modal.borrow().iter().any(|entry| entry.index == index) {
+            panic!("模态资产不能被其他独立窗口克隆 / 窃取：{name}");
+        }
+    }
+
+    /// 把名下叫 `name` 的资产**克隆**一份交给请求方（来源侧入口，原件不动）。
+    ///
+    /// 没这件、或者资产没实现 [`Clonable`]（[`Asset::as_clonable`] 返回 `None`）时返回 `None`。
+    ///
+    /// # Panics
+    ///
+    /// `name` 是模态资产时 panic（见 [`Self::ensure_cloneable`]）。
+    pub fn clone_asset(&self, name: &str) -> Option<Box<dyn Asset>> {
+        self.ensure_cloneable(name);
+        let index = self.index_of(name)?;
+        Some(self.items[index].as_clonable()?.clone_asset())
+    }
+
+    /// **窃取**名下叫 `name` 的资产：先克隆一份交给请求方，再把原件销毁
+    /// （焦点按 §4 规则 7 在销毁前自动归还）。
+    ///
+    /// 没这件、或者资产没实现 [`Clonable`] 时返回 `None`，原件保持不动。
+    ///
+    /// # Panics
+    ///
+    /// `name` 是模态资产时 panic（见 [`Self::ensure_cloneable`]）。
+    pub fn steal_asset(&mut self, name: &str) -> Option<Box<dyn Asset>> {
+        self.ensure_cloneable(name);
+        let index = self.index_of(name)?;
+        let cloned = self.items[index].as_clonable()?.clone_asset();
+        self.retire_named(name);
+        Some(cloned)
+    }
+
+    /// 清掉整个模态栈（宿主销毁之前调）。
+    fn clear_modal(&self) {
+        let stack = std::mem::take(&mut *self.modal.borrow_mut());
+        for entry in stack.iter().rev() {
+            if entry.active
+                && let Some(asset) = self.items.get(entry.index)
+            {
+                asset.set_modal(false);
+            }
+        }
+    }
+
+    /// 宿主贴出一帧 / 开关变了：把全部资产驱动一遍 —— 手上把自己（作为 [`Bridge`]）借给它们，
+    /// 它们要什么经桥接回来要。
+    pub fn sync(&self, owner: &dyn Bridge) {
+        // 焦点只可能落在**所有者**、或一件**声明过** `able_to_get_focus` 的资产上（指定时查过一遍）。
+        // 在驱动这一拍上复核：将来谁改了指定的路，这里第一时间叫出来。
+        debug_assert!(
+            self.allows(self.focus.get()),
+            "焦点落在接不住的窗口上：{:?}",
+            self.focus.get()
+        );
+        for asset in &self.items {
+            asset.sync(owner);
+        }
+        // 模态 dialog 在宿主重新显示后要拿回焦点：它是模态，输入不能留在被挡住的所有者身上。
+        let dialog = self
+            .modal
+            .borrow()
+            .last()
+            .copied()
+            .filter(|entry| entry.active && entry.dialog);
+        if let Some(entry) = dialog
+            && owner.host().rect.is_some()
+            && matches!(self.focus.get(), Focus::Owner)
+            && let Some(asset) = self.items.get(entry.index)
+        {
+            let name = asset.name().to_owned();
+            self.designate_focus(&name);
+        }
+    }
+
+    /// 全部收起（宿主收起时）。**带着焦点的那件一收起就先自动归还焦点** —— 否则它看不见了、
+    /// 所有者又不接输入，这一组没人响应鼠标 / 键盘。
+    pub fn hide(&self) {
+        self.return_focus_to_owner();
+        for asset in &self.items {
+            asset.hide();
+        }
+    }
+
+    /// 放掉全部资产（宿主销毁**之前**的第一件事）：**销毁前一刻先自动归还焦点** ——
+    /// 焦点不能落在一件马上就要没了的资产上；模态也一并取消。
+    pub fn retire(&mut self) {
+        self.clear_modal();
+        self.return_focus_to_owner();
+        self.items.clear();
+    }
+
+    /// 放掉名下叫 `name` 的那一件（脚本 `close`）：焦点落在它身上就先归还；落在后面的姊妹资产身上
+    /// 就把下标跟着前移（焦点不换人）。不重名的前提下其它资产一概不动。
+    ///
+    /// 如果放掉的是模态栈顶，先收回它的模态，再把下一个（更早的）模态恢复 ——
+    /// dialog 销毁后，被它临时挂起的原模态窗口重新获得模态。栈里后面的下标跟着前移。
+    pub fn retire_named(&mut self, name: &str) {
+        let Some(index) = self.index_of(name) else {
+            return;
+        };
+        let held = self.focus.get();
+        let removed = self.items.remove(index);
+        let reactivate = {
+            let mut stack = self.modal.borrow_mut();
+            let reactivate =
+                if let Some(position) = stack.iter().position(|entry| entry.index == index) {
+                    stack.remove(position).active
+                } else {
+                    false
+                };
+            for entry in stack.iter_mut() {
+                if entry.index > index {
+                    entry.index -= 1;
+                }
+            }
+            reactivate
+        };
+        if reactivate {
+            // 栈顶没了：先收回它的模态，再把新的栈顶（如果有）恢复
+            removed.set_modal(false);
+            self.activate_top();
+        }
+        match held {
+            Focus::Asset(at) if at == index => {
+                // 拿着焦点的那件被放掉了：先归还，焦点不能落在一件已经没了的资产上
+                self.focus.set(Focus::Owner);
+            }
+            Focus::Asset(at) if at > index => self.focus.set(Focus::Asset(at - 1)),
+            _ => {}
+        }
+    }
+
+    /// 名下叫 `name` 的那件资产（只读借一下；所有权仍在 [`Self`] 里）。
+    pub fn get(&self, name: &str) -> Option<&dyn Asset> {
+        self.index_of(name).map(|index| self.items[index].as_ref())
+    }
+
+    /// 名下叫 `name` 的那件资产在第几位（[`Self::add`] 查重与 [`Self::designate_focus`] 指认都用）。
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.items.iter().position(|asset| asset.name() == name)
+    }
+
+    /// 焦点换人：老持有者**失焦**、新持有者**聚焦**。返回是否真换了人（本来就在 `target` 手上就是 `false`）。
+    ///
+    /// 焦点是**转移**不是复制 —— 一组里任何时刻只有一个持有者。
+    fn move_focus(&self, target: Focus) -> bool {
+        let previous = self.focus.get();
+        if previous == target {
+            return false;
+        }
+        self.focus.set(target);
+        tracing::debug!(
+            from = %self.describe(previous),
+            to = %self.describe(target),
+            "焦点换人"
+        );
+        if let Focus::Asset(index) = previous
+            && let Some(asset) = self.items.get(index)
+        {
+            asset.unfocusing();
+        }
+        if let Focus::Asset(index) = target
+            && let Some(asset) = self.items.get(index)
+        {
+            asset.focusing();
+        }
+        true
+    }
+
+    /// `target` 这会儿接不接得住焦点：所有者永远接得住；资产得声明过 [`Asset::able_to_get_focus`]。
+    fn allows(&self, target: Focus) -> bool {
+        match target {
+            Focus::Owner => true,
+            Focus::Asset(index) => self
+                .items
+                .get(index)
+                .is_some_and(|asset| asset.able_to_get_focus()),
+        }
+    }
+
+    /// 日志里的说法：所有者自己，还是哪件资产（带名字）。
+    fn describe(&self, holder: Focus) -> String {
+        match holder {
+            Focus::Owner => "所有者".to_owned(),
+            Focus::Asset(index) => self
+                .items
+                .get(index)
+                .map_or_else(|| format!("资产#{index}"), |asset| asset.name().to_owned()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cloud_ui_types::LayoutMode;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use super::*;
+
+    /// 测试用的所有者：固定一套「开着没有 + 宿主形状」。
+    struct Owner {
+        on: bool,
+        expanded: bool,
+    }
+
+    impl Bridge for Owner {
+        fn host(&self) -> Host {
+            Host {
+                rect: None,
+                layout: LayoutMode::Vertical,
+                expanded: self.expanded,
+            }
+        }
+
+        fn asset_on(&self) -> bool {
+            self.on
+        }
+
+        fn designate_focus(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn return_focus_to_owner(&self) {}
+    }
+
+    /// 测试用资产：声明自己允不允许获取焦点，并把「聚焦 / 失焦」「模态」「收起」「放掉」记成一串事件。
+    struct Tracked {
+        name: &'static str,
+        focusable: bool,
+        kind: AssetKind,
+        events: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Tracked {
+        fn new(
+            name: &'static str,
+            focusable: bool,
+            events: Rc<RefCell<Vec<&'static str>>>,
+        ) -> Self {
+            Self {
+                name,
+                focusable,
+                kind: AssetKind::Auxiliary,
+                events,
+            }
+        }
+
+        fn dialog(
+            name: &'static str,
+            focusable: bool,
+            events: Rc<RefCell<Vec<&'static str>>>,
+        ) -> Self {
+            Self {
+                name,
+                focusable,
+                kind: AssetKind::Dialog,
+                events,
+            }
+        }
+
+        fn record(&self, what: &'static str) {
+            self.events.borrow_mut().push(what);
+        }
+    }
+
+    impl Asset for Tracked {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn kind(&self) -> AssetKind {
+            self.kind
+        }
+
+        fn sync(&self, _owner: &dyn Bridge) {}
+
+        fn hide(&self) {
+            self.record("hide");
+        }
+
+        fn able_to_get_focus(&self) -> bool {
+            self.focusable
+        }
+
+        fn set_modal(&self, modal: bool) {
+            self.record(if modal { "modal" } else { "unmodal" });
+        }
+
+        fn as_clonable(&self) -> Option<&dyn Clonable> {
+            Some(self)
+        }
+
+        fn focusing(&self) {
+            self.record("focus");
+        }
+
+        fn unfocusing(&self) {
+            self.record("unfocus");
+        }
+    }
+
+    impl Clonable for Tracked {
+        fn clone_asset(&self) -> Box<dyn Asset> {
+            self.record("clone");
+            Box::new(Tracked::new(self.name, self.focusable, self.events.clone()))
+        }
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.record("drop");
+        }
+    }
+
+    /// 测试用资产：记下自己被收起过几次、什么时候被放掉。
+    struct Fake {
+        dropped: Rc<Cell<bool>>,
+        hidden: Rc<Cell<u32>>,
+    }
+
+    impl Asset for Fake {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn sync(&self, _owner: &dyn Bridge) {}
+
+        fn hide(&self) {
+            self.hidden.set(self.hidden.get() + 1);
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+
+    /// `retire()` 一调资产就没了（宿主销毁之前先调它）；`hide()` 只收起、不放掉。
+    #[test]
+    fn retiring_assets_drops_them_while_hiding_keeps_them() {
+        let dropped = Rc::new(Cell::new(false));
+        let hidden = Rc::new(Cell::new(0));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Fake {
+            dropped: dropped.clone(),
+            hidden: hidden.clone(),
+        }));
+
+        assets.hide();
+        assert_eq!(hidden.get(), 1);
+        assert!(!dropped.get(), "收起不等于放掉");
+
+        assets.retire();
+        assert!(dropped.get(), "retire 才放掉资产");
+    }
+
+    /// 资产拿到的只有所有者经**桥接**交过来的那一个口子：`sync` 时它读到的是所有者说的那套值。
+    #[test]
+    fn assets_see_their_owners_bridge() {
+        struct Spy(Rc<RefCell<Option<(bool, bool)>>>);
+        impl Asset for Spy {
+            fn name(&self) -> &'static str {
+                "spy"
+            }
+
+            fn sync(&self, owner: &dyn Bridge) {
+                *self.0.borrow_mut() = Some((owner.asset_on(), owner.host().expanded));
+            }
+
+            fn hide(&self) {}
+        }
+
+        let seen = Rc::new(RefCell::new(None));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Spy(seen.clone())));
+        assets.sync(&Owner {
+            on: true,
+            expanded: true,
+        });
+        assert_eq!(*seen.borrow(), Some((true, true)));
+    }
+
+    /// 焦点缺省在所有者身上；只有**声明过** `able_to_get_focus` 的资产接得住（没这个名字的也不行）。
+    #[test]
+    fn focus_starts_on_the_owner_and_only_declared_assets_can_take_it() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("focusable", true, events.clone())));
+        assets.add(Box::new(Tracked::new("plain", false, events.clone())));
+        assert_eq!(assets.focus(), Focus::Owner, "缺省在所有者身上");
+
+        assert!(
+            !assets.designate_focus("plain"),
+            "没声明 able_to_get_focus → 接不住"
+        );
+        assert!(!assets.designate_focus("没有这件"), "没这个名字");
+        assert_eq!(assets.focus(), Focus::Owner);
+        assert!(events.borrow().is_empty(), "没人拿到过焦点");
+
+        assert!(assets.designate_focus("focusable"));
+        assert_eq!(assets.focus(), Focus::Asset(0));
+        assert_eq!(*events.borrow(), ["focus"], "接手的**聚焦**了");
+        assert!(
+            !assets.designate_focus("focusable"),
+            "已经在它手上，不用再动"
+        );
+    }
+
+    /// 焦点在资产之间挪、以及归还给所有者：老的**失焦**、新的**聚焦**（顺序不能反）。
+    #[test]
+    fn focus_moves_between_assets_and_comes_back_to_the_owner() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("first", true, events.clone())));
+        assets.add(Box::new(Tracked::new("second", true, events.clone())));
+
+        assert!(assets.designate_focus("first"));
+        assert!(assets.designate_focus("second"));
+        assert_eq!(assets.focus(), Focus::Asset(1));
+        assert_eq!(*events.borrow(), ["focus", "unfocus", "focus"]);
+
+        assert!(assets.return_focus_to_owner());
+        assert_eq!(assets.focus(), Focus::Owner);
+        assert_eq!(*events.borrow(), ["focus", "unfocus", "focus", "unfocus"]);
+        assert!(!assets.return_focus_to_owner(), "本来就在所有者手上");
+    }
+
+    /// 收起与生命周期末都**自动**归还焦点：收起时先归还再收起，销毁时先归还再放掉 ——
+    /// 焦点不会落在一件看不见、或者马上就要没了的资产上。
+    #[test]
+    fn hiding_and_retiring_return_the_focus_before_they_go() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("only", true, events.clone())));
+        assert!(assets.designate_focus("only"));
+
+        assets.hide();
+        assert_eq!(assets.focus(), Focus::Owner, "一收起就自动归还");
+        assert_eq!(
+            *events.borrow(),
+            ["focus", "unfocus", "hide"],
+            "先归还再收起"
+        );
+
+        events.borrow_mut().clear();
+        assert!(assets.designate_focus("only"));
+        assets.retire();
+        assert_eq!(assets.focus(), Focus::Owner, "销毁前一刻自动归还");
+        assert_eq!(
+            *events.borrow(),
+            ["focus", "unfocus", "drop"],
+            "先归还再放掉"
+        );
+    }
+
+    /// 一组（所有者 + 名下的资产）里**任何时刻恰好一个**持有者 —— 焦点是**转移**不是复制。
+    /// 走几轮「指定第一件 → 转手第二件 → 归还」，每件资产的日志都是「聚焦 / 失焦」交替，不会连着来两次聚焦。
+    #[test]
+    fn focus_is_transferred_never_copied() {
+        let first = Rc::new(RefCell::new(Vec::new()));
+        let second = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("first", true, first.clone())));
+        assets.add(Box::new(Tracked::new("second", true, second.clone())));
+
+        for _ in 0..3 {
+            assert!(assets.designate_focus("first"));
+            assert!(assets.designate_focus("second"));
+            assert!(assets.return_focus_to_owner());
+        }
+        let alternating = ["focus", "unfocus", "focus", "unfocus", "focus", "unfocus"];
+        assert_eq!(*first.borrow(), alternating, "第一件");
+        assert_eq!(*second.borrow(), alternating, "第二件");
+        assert_eq!(assets.focus(), Focus::Owner);
+    }
+
+    /// 桥上也有「把焦点交还给所有者」这条：辅助窗口自己要把焦点放回去时走它
+    /// （收起与生命周期末那两条是资产表自动走的，资产不用操心）。
+    #[test]
+    fn an_asset_can_hand_the_focus_back_through_the_bridge() {
+        struct Asked(Rc<Cell<u32>>);
+
+        impl Bridge for Asked {
+            fn host(&self) -> Host {
+                Host::default()
+            }
+
+            fn asset_on(&self) -> bool {
+                true
+            }
+
+            fn designate_focus(&self, _name: &str) -> bool {
+                false
+            }
+
+            fn return_focus_to_owner(&self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        struct Hands;
+
+        impl Asset for Hands {
+            fn name(&self) -> &'static str {
+                "hands"
+            }
+
+            fn sync(&self, owner: &dyn Bridge) {
+                owner.return_focus_to_owner();
+            }
+
+            fn hide(&self) {}
+        }
+
+        let asked = Rc::new(Cell::new(0));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Hands));
+        assets.sync(&Asked(asked.clone()));
+        assert_eq!(asked.get(), 1, "sync 里经桥请所有者把焦点收回");
+    }
+
+    /// **同一所有者**的两件辅助窗口之间转移焦点**经桥接**：A1 在 `sync` 里请所有者把焦点交给 A2
+    /// （资产之间不直接通讯，只能委托所有者 —— `docs/design/windows.md` §4 规则 2）。
+    #[test]
+    fn siblings_hand_the_focus_over_through_the_bridge() {
+        /// 所有者：把资产表借给桥用（真身上是宿主独立窗口自己）。
+        struct Owner<'a>(&'a Assets);
+
+        impl Bridge for Owner<'_> {
+            fn host(&self) -> Host {
+                Host::default()
+            }
+
+            fn asset_on(&self) -> bool {
+                true
+            }
+
+            fn designate_focus(&self, name: &str) -> bool {
+                self.0.designate_focus(name)
+            }
+
+            fn return_focus_to_owner(&self) {
+                self.0.return_focus_to_owner();
+            }
+        }
+
+        /// 一件资产：`sync` 时按 `ask` 里写的名字请所有者把焦点转过去（模拟 A1 让位给 A2）。
+        struct Sibling {
+            name: &'static str,
+            ask: Option<&'static str>,
+        }
+
+        impl Asset for Sibling {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+
+            fn sync(&self, owner: &dyn Bridge) {
+                if let Some(name) = self.ask {
+                    assert!(owner.designate_focus(name), "经桥指定给 {name}");
+                }
+            }
+
+            fn hide(&self) {}
+
+            fn able_to_get_focus(&self) -> bool {
+                true
+            }
+        }
+
+        let mut assets = Assets::default();
+        assets.add(Box::new(Sibling {
+            name: "a1",
+            ask: Some("a2"),
+        }));
+        assets.add(Box::new(Sibling {
+            name: "a2",
+            ask: None,
+        }));
+        assert!(assets.designate_focus("a1"), "先让 A1 拿到焦点");
+        assert_eq!(assets.focus(), Focus::Asset(0));
+
+        // 驱动那一拍：A1 自己把焦点让给同一所有者名下的 A2
+        assets.sync(&Owner(&assets));
+        assert_eq!(assets.focus(), Focus::Asset(1), "焦点转到了 A2");
+    }
+
+    /// §4 规则 8：**资产克隆 / 窃取**来的资产与原件具备同样的特性（能不能获得焦点照旧），但**不会第一时间
+    /// 拿到焦点** —— 焦点仍在它的所有者、或同一所有者名下的某件姊妹资产身上。
+    ///
+    /// 克隆与窃取在**这一组**里是同一个落点（往资产表里加一件，`Assets::add`），差别只在原件那边
+    /// （窃取会销毁原件、它那一组按规则 7 自动归还焦点；克隆不扰动别人）。
+    #[test]
+    fn cloned_or_stolen_assets_keep_their_capability_but_never_take_the_focus() {
+        // 先有一件能获得焦点的姊妹资产，并且它正拿着焦点
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("sibling", true, events.clone())));
+        assert!(assets.designate_focus("sibling"));
+        assert_eq!(assets.focus(), Focus::Asset(0));
+
+        // 「窃取」进来一件：克隆自别的所有者名下、本来能获得焦点的原件
+        assets.add(Box::new(Tracked::new("stolen", true, events.clone())));
+        assert_eq!(
+            assets.focus(),
+            Focus::Asset(0),
+            "焦点还在姊妹资产身上，没跟着新来的走"
+        );
+        assert_eq!(*events.borrow(), ["focus"], "新来的没聚焦、也没让别人失焦");
+
+        // 特性照旧：它**能**拿到焦点（只是要所有者指定）
+        assert!(assets.designate_focus("stolen"));
+        assert_eq!(assets.focus(), Focus::Asset(1));
+
+        // 另一件窃取来的、原本就不能获得焦点的：同样不动焦点，也照样接不住
+        assets.add(Box::new(Tracked::new(
+            "stolen-plain",
+            false,
+            events.clone(),
+        )));
+        assert_eq!(assets.focus(), Focus::Asset(1), "也没跟着走");
+        assert!(!assets.designate_focus("stolen-plain"), "特性照旧：接不住");
+        assert_eq!(assets.focus(), Focus::Asset(1));
+    }
+
+    /// 脚本 `close` 掉一件辅助窗口：只放掉那一件。焦点落在后面的姊妹资产身上时下标跟着前移
+    ///（还是同一件拿着），落在被关的那件身上时先归还给所有者。
+    #[test]
+    fn closing_one_asset_leaves_the_others_alone() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("first", true, events.clone())));
+        assets.add(Box::new(Tracked::new("second", true, events.clone())));
+        assert!(assets.designate_focus("second"));
+        assert!(assets.focused_name_is("second"));
+        assert!(!assets.focused_name_is("first"));
+
+        assets.retire_named("first");
+        assert_eq!(
+            assets.focus(),
+            Focus::Asset(0),
+            "焦点还在 second 身上（下标前移）"
+        );
+        assert!(!assets.designate_focus("first"), "第一件已经没了");
+        assert_eq!(
+            *events.borrow(),
+            ["focus", "drop"],
+            "焦点不动，只放掉第一件"
+        );
+
+        // 关掉正拿着焦点的那件：先归还给所有者
+        assets.retire_named("second");
+        assert_eq!(assets.focus(), Focus::Owner, "拿着焦点的资产一关就归还");
+
+        // 没这个名字：什么也不做
+        assets.retire_named("missing");
+    }
+
+    /// 模态：同组只允许一件；取消后恢复；桥接（`sync`）在模态期间照旧。
+    #[test]
+    fn only_one_modal_asset_and_bridging_keeps_working() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("a", true, events.clone())));
+        assets.add(Box::new(Tracked::new("b", true, events.clone())));
+        assert_eq!(assets.modal(), None, "缺省没有模态");
+
+        assert!(assets.set_modal("a", true));
+        assert_eq!(assets.modal(), Some("a"));
+        assert_eq!(*events.borrow(), ["modal"]);
+        assert!(
+            !assets.set_modal("b", true),
+            "同一所有者名下只能有一件模态资产"
+        );
+        assert_eq!(assets.modal(), Some("a"), "没有把前一件顶掉");
+        assert!(!assets.set_modal("a", true), "本来就是这个状态");
+        assert!(!assets.set_modal("missing", true), "没这个名字");
+
+        // 模态期间桥接照旧：sync 仍然把所有者借给资产用。
+        assets.sync(&Owner {
+            on: true,
+            expanded: false,
+        });
+        assert_eq!(assets.modal(), Some("a"), "驱动资产不改模态");
+
+        assert!(assets.set_modal("a", false));
+        assert_eq!(assets.modal(), None);
+        assert_eq!(*events.borrow(), ["modal", "unmodal"]);
+        assert!(!assets.set_modal("a", false), "已经取消了");
+    }
+
+    /// 模态资产被销毁时**先取消模态**；只放掉前面的资产时模态下标跟着前移，不换人。
+    #[test]
+    fn retiring_the_modal_asset_clears_modal_first() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("first", false, events.clone())));
+        assets.add(Box::new(Tracked::new("modal", false, events.clone())));
+        assert!(assets.set_modal("modal", true));
+        assert_eq!(assets.modal(), Some("modal"));
+
+        // 放掉前面那件：模态还是同一件（下标前移）
+        assets.retire_named("first");
+        assert_eq!(assets.modal(), Some("modal"));
+
+        // 放掉模态那件：先取消模态，再销毁
+        assets.retire_named("modal");
+        assert_eq!(assets.modal(), None);
+        assert_eq!(*events.borrow(), ["modal", "drop", "unmodal", "drop"]);
+
+        // 宿主销毁前 `retire()` 一样要把模态收掉
+        assets.add(Box::new(Tracked::new("last", false, events.clone())));
+        assert!(assets.set_modal("last", true));
+        assets.retire();
+        assert_eq!(assets.modal(), None);
+        assert_eq!(
+            *events.borrow(),
+            [
+                "modal", "drop", "unmodal", "drop", "modal", "unmodal", "drop"
+            ]
+        );
+    }
+
+    /// 普通资产可以克隆 / 窃取：克隆件是新资产，窃取会把原件销毁。
+    #[test]
+    fn non_modal_assets_can_be_cloned_and_stolen() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("a", false, events.clone())));
+
+        let cloned = assets.clone_asset("a").expect("实现 Clonable 就能克隆");
+        assert_eq!(cloned.name(), "a");
+        assert_eq!(assets.modal(), None, "克隆不改来源的模态状态");
+
+        let stolen = assets.steal_asset("a").expect("实现 Clonable 就能窃取");
+        assert_eq!(stolen.name(), "a");
+        assert!(assets.clone_asset("a").is_none(), "原件已经被销毁");
+        assert_eq!(*events.borrow(), ["clone", "clone", "drop"]);
+    }
+
+    /// 模态资产**不能克隆**：来源侧入口直接 panic。
+    #[test]
+    #[should_panic(expected = "模态资产不能被其他独立窗口克隆 / 窃取")]
+    fn cloning_a_modal_asset_panics() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("modal", false, events)));
+        assert!(assets.set_modal("modal", true));
+        let _ = assets.clone_asset("modal");
+    }
+
+    /// 模态资产**不能窃取**：来源侧入口直接 panic，且不会先销毁原件。
+    #[test]
+    #[should_panic(expected = "模态资产不能被其他独立窗口克隆 / 窃取")]
+    fn stealing_a_modal_asset_panics() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("modal", false, events)));
+        assert!(assets.set_modal("modal", true));
+        let _ = assets.steal_asset("modal");
+    }
+
+    /// dialog 创建即模态：原模态被挂起，dialog 销毁后原模态自动恢复。
+    #[test]
+    fn dialog_suspends_the_previous_modal_and_restores_it() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("panel", true, events.clone())));
+        assert!(assets.set_modal("panel", true));
+        assert_eq!(assets.modal(), Some("panel"));
+        assert!(assets.designate_focus("panel"), "焦点先给普通资产");
+
+        assets.add(Box::new(Tracked::dialog("dialog", true, events.clone())));
+        assert_eq!(assets.modal(), Some("dialog"), "dialog 压到栈顶");
+        assert!(assets.modal_is_dialog());
+        assert_eq!(
+            assets.focus(),
+            Focus::Asset(1),
+            "dialog 自动从别的资产手里接过焦点"
+        );
+
+        assets.retire_named("dialog");
+        assert_eq!(assets.modal(), Some("panel"), "原模态自动恢复");
+        assert!(!assets.modal_is_dialog());
+        assert_eq!(assets.focus(), Focus::Owner, "dialog 销毁后焦点回到所有者");
+
+        let events = events.borrow();
+        assert!(events.contains(&"unmodal"), "原模态被临时取消过");
+        assert_eq!(
+            events.iter().filter(|event| **event == "modal").count(),
+            3,
+            "panel 模态 / dialog 模态 / panel 恢复：{events:?}"
+        );
+    }
+
+    /// dialog 可以嵌套：内层销毁后外层 dialog 恢复模态。
+    #[test]
+    fn nested_dialogs_restore_the_one_below() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::dialog("outer", true, events.clone())));
+        assets.add(Box::new(Tracked::dialog("inner", true, events.clone())));
+        assert_eq!(assets.modal(), Some("inner"));
+
+        assets.retire_named("inner");
+        assert_eq!(assets.modal(), Some("outer"));
+        assert!(assets.modal_is_dialog());
+    }
+
+    /// 被 dialog 临时挂起的普通模态资产仍然禁止克隆 / 窃取。
+    #[test]
+    #[should_panic(expected = "模态资产不能被其他独立窗口克隆 / 窃取")]
+    fn a_suspended_modal_asset_is_still_not_clonable() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut assets = Assets::default();
+        assets.add(Box::new(Tracked::new("panel", false, events.clone())));
+        assert!(assets.set_modal("panel", true));
+        assets.add(Box::new(Tracked::dialog("dialog", false, events)));
+        assert_eq!(assets.modal(), Some("dialog"));
+        let _ = assets.clone_asset("panel");
+    }
+}

@@ -1,0 +1,1193 @@
+//! **辅助窗口模板**（`auxiliary_window_template`）：给「辅助窗口」（独立窗口的**资产**，
+//! 见 [`super::auxiliary`]）共用的那块壳子 —— 一块自绘的**分层面板**。
+//!
+//! 画的是**一块面板**：主题背景色 + 圆角 + 阴影。
+//! 走**渲染**（`docs/design/windows.md` §6）：渲染器把整块（阴影 + 圆角 + 内容）出成预乘 RGBA 位图，
+//! `UpdateLayeredWindow` 一次贴上 —— 贴上去之后窗口刷新不会把它擦掉。
+//!
+//! 三个属性：**宽 / 高 / 间隙**（[`AuxiliaryWindowSpec`]，物理像素）。没设过就按内容与宿主的形状来：
+//!
+//! - **有内容**：`Document` 自带尺寸，面板跟着内容走；
+//! - **没内容**（版面还没生成）：按渲染器给出的参考尺寸算一块空面板，竖排 / 横排各有缺省；
+//! - 间隙固定 16 逻辑像素（按 DPI 折成物理像素）。
+//!
+//! 摆位（[`AuxiliaryWindowTemplate::show`] 给宿主的内容区矩形与排布方向）：按**宿主矩形中心点**
+//! 所在的半屏往另一边摆 —— 竖排时中心在屏幕右半边就贴**左侧**（否则贴右侧），横排时中心在下半边就贴
+//! **上方**（否则贴下方）；最后整体夹进所在显示器的工作区。
+//!
+//! **只管画与摆**：什么时候显示 / 收起由用它的那件资产自己定（拿 [`super::auxiliary::Asset`] 实现它）。
+//!
+//! **焦点**：这块面板**默认不具备焦点** —— 鼠标一律穿透到下面的窗口，键也轮不到它（窗口建出来就带
+//! `WS_EX_TRANSPARENT`，命中测试也回 `HTTRANSPARENT`）。创建时声明了允许获取焦点
+//! （[`AuxiliaryWindowTemplate::new`] 的 `able_to_get_focus`）也只是「能」：真拿到要所有者**指定**（`ui::auxiliary`
+//! 那套 [`super::auxiliary::Focus`]）；拿到之后才接鼠标（[`AuxiliaryWindowTemplate::set_focused`]），
+//! 同时所有者那侧让位（见 [`super::independent_window_template`]）。
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
+
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect, HTCLIENT,
+    HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, IsWindow, LoadCursorW,
+    MA_NOACTIVATE, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetCursor, SetWindowPos, ShowWindow, WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONUP, WM_SETCURSOR,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+};
+use windows::core::{PCWSTR, Result, w};
+
+use cloud_ui_types::LayoutMode;
+use cloudime_render::{Color, ControlName, Layout, StaticTextContent};
+
+use crate::WindowMask;
+use crate::auxiliary::Bridge;
+use crate::layered;
+use crate::monitor;
+use crate::painter::{Painter, SharedPainter};
+use crate::text_edit::TextHostWindow;
+use crate::window::{module_handle, mouse_transparent, set_mouse_transparent};
+use crate::window_class::WindowClass;
+
+const CLASS_NAME: PCWSTR = w!("CloudIMEAuxiliaryWindow");
+static CLASS: WindowClass = WindowClass::new();
+
+thread_local! {
+    /// 本线程建出来的辅助窗口面板（HWND → 模板）：窗口过程收鼠标事件时按它找回 Rust 状态。
+    /// 存 `Weak`：不替模板续命，`Drop` 之后自然没了。
+    static REGISTRY: RefCell<HashMap<isize, Weak<AuxiliaryWindowTemplate>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// 与候选窗口之间的默认间隙（**逻辑像素**，按 DPI 折成物理像素）。
+pub const DEFAULT_GAP: i32 = 16;
+
+/// 竖排的默认高度按「候选窗口装 9 个候选项」量。
+const VERTICAL_ROWS: usize = 9;
+
+/// 横排的默认宽度按「候选窗口装 6 个候选项」量（每个候选假定两个字）。
+const HORIZONTAL_ROWS: usize = 6;
+
+/// 辅助窗口模板的种类：普通辅助窗口（JSON / 调用方内容）还是内置对话框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AssetKind {
+    /// 普通辅助窗口（缺省）。
+    #[default]
+    Auxiliary,
+
+    /// 内置对话框：创建即强制模态，生命周期内不能取消模态。
+    Dialog,
+}
+
+/// 窗口模板的三个属性（**物理像素**）；`None` = 用按候选窗口形状算出来的默认值。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuxiliaryWindowSpec {
+    /// 宽。
+    pub width: Option<i32>,
+
+    /// 高。
+    pub height: Option<i32>,
+
+    /// 与候选窗口之间的间隙。
+    pub gap: Option<i32>,
+}
+
+/// 内置对话框的创建参数（正文内容之后按具体 dialog 种类再补；现在先留空）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DialogOptions {
+    /// 是否要求所有者开蒙版（默认 `WindowMask::dim(0.35)`）；销毁时恢复原蒙版。
+    pub mask: bool,
+}
+
+/// 面板里画什么。
+enum Content {
+    /// 空面板：主题背景 + 圆角 + 阴影，尺寸按宿主形状 / 用户设的属性算。
+    Empty,
+
+    /// 脚本给的一份内容（`cloudime.window.create_auxiliary` + `set_content`）。
+    Document(cloudime_render::Document),
+}
+
+/// 面板摆在宿主旁边还是居中盖在宿主上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    Beside,
+    Centered,
+}
+
+/// 面板上的鼠标动作（键位映射参考不接鼠标；脚本辅助窗口接）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelAction {
+    Click,
+    RightClick,
+    Hover,
+    Leave,
+    Wheel,
+}
+
+impl PanelAction {
+    /// 与脚本窗口事件同名，布局的 `events` 表用它查处理器。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Click => "click",
+            Self::RightClick => "right_click",
+            Self::Hover => "hover",
+            Self::Leave => "leave",
+            Self::Wheel => "wheel",
+        }
+    }
+}
+
+/// 一次面板鼠标事件：坐标是**内容区点**；`element` 是命中的元素（1 起，`None` = 没命中），
+/// `region` 是命中的区域名（`Document.regions` 里的 `name`）。
+#[derive(Debug, Clone)]
+pub struct PanelEvent {
+    pub action: PanelAction,
+    pub x: f32,
+    pub y: f32,
+    pub element: Option<usize>,
+    pub region: Option<String>,
+    pub control: Option<String>,
+    pub handler: Option<String>,
+    pub delta: Option<i32>,
+}
+
+/// 面板鼠标事件的出口：脚本辅助窗口用它把点击 / 悬停送回工人线程。
+pub type PanelEvents = Box<dyn Fn(PanelEvent) + Send>;
+
+/// 窗口模板创建的那个窗口；不显示时只是藏在层里。
+pub struct AuxiliaryWindowTemplate {
+    hwnd: HWND,
+
+    /// 内置种类：普通辅助窗口 / 对话框。
+    kind: AssetKind,
+
+    /// 对话框要求所有者开的蒙版；`None` = 不碰所有者蒙版。
+    mask: Option<WindowMask>,
+
+    /// 是否已经替所有者切到 `mask`（销毁 / detach 时恢复 `previous_mask`）。
+    mask_applied: Cell<bool>,
+
+    /// 应用蒙版之前所有者原来的蒙版。
+    previous_mask: Cell<Option<WindowMask>>,
+
+    /// 这会儿是不是**模态**（所有者经 [`super::auxiliary::Assets::set_modal`] 设的）。
+    modal: Cell<bool>,
+
+    /// 创建时声明的「允许获取焦点」（`able_to_get_focus`）：`false`（缺省）时**永远**不接输入。
+    focusable: bool,
+
+    /// 这会儿焦点在不在它身上（所有者经 [`Self::set_focused`] 指定）。
+    focused: Cell<bool>,
+
+    /// 云朵渲染器；`None` 不绘制（字体库加载失败）。
+    painter: SharedPainter,
+
+    /// 上次用的 DPI。
+    dpi: Cell<u32>,
+
+    /// 用户设过的三个属性；`None` 的项现算默认。
+    spec: Cell<AuxiliaryWindowSpec>,
+
+    /// 面板里画什么。
+    content: RefCell<Content>,
+
+    /// 鼠标事件出口；`None` = 不接鼠标（键位映射参考）。
+    events: RefCell<Option<PanelEvents>>,
+
+    /// 最近一帧每个元素的命中区域（内容区坐标，点）：脚本辅助窗口的鼠标事件用。
+    hits: RefCell<Vec<Option<cloudime_render::HitShape>>>,
+
+    /// 脚本内容里声明的区域（点击 / 拖拽范围）。
+    regions: RefCell<Vec<cloudime_render::Region>>,
+
+    /// 脚本内容里的控件名（布局文件）：事件里给 `control`。
+    control_names: RefCell<Vec<ControlName>>,
+
+    /// 鼠标正停在哪个元素上（1 起；`None` = 没停在任何元素上）：悬停事件只在换元素时派。
+    /// 与区域一起组成「这一拍停在哪」，换元素 / 换区域都算换。
+    hover: Cell<Option<(Option<usize>, Option<usize>)>>,
+
+    /// 最后一次收到的客户区坐标：离开窗口时用它报位置。
+    last: Cell<(i32, i32)>,
+
+    /// 最近一帧的渲染倍数（点 → 像素）。
+    scale: Cell<f32>,
+
+    /// 最近一帧位图四周的阴影留白（像素）。
+    margin: Cell<i32>,
+
+    /// 要不要阴影（脚本可以关掉；键位映射参考 / 空面板按缺省开）。
+    shadow: Cell<bool>,
+
+    /// 要不要画窗口面板背景（主题底色 + 圆角）。消息对话框自己画整块背景时关掉，避免两套底色在圆角处叠出亮边。
+    background: Cell<bool>,
+
+    /// 这次显示摆在哪（内容左上角 + 内容尺寸；物理像素）；`None` = 没显示。
+    placed: Cell<Option<(i32, i32, i32, i32)>>,
+
+    /// 版面版本：`set_key_map` / `set_document` 每换一次 +1（判断要不要重画）。
+    revision: Cell<u64>,
+
+    /// 上次真画出来的是哪一幅（位置 / 尺寸 / 版面版本 / 渲染器代号）：一样就不再重画。
+    painted: Cell<Option<Painted>>,
+
+    /// 建窗口时的所有者；dialog 拖拽时跟着一起挪。
+    owner: Option<HWND>,
+
+    /// dialog 拖拽的起点（光标 + 对话框 / 所有者窗口位置）；`None` = 没在拖。
+    drag: Cell<Option<DialogDrag>>,
+
+    /// 这一按是否已经真的拖动过：拖动过的左键抬起不再当点击。
+    dragged: Cell<bool>,
+
+    /// dialog 拖拽时跟着所有者一起挪的 RichEdit 宿主（所有者名下的 + 对话框自己的）。
+    follow_hosts: RefCell<Vec<Rc<TextHostWindow>>>,
+
+    /// dialog 拖拽时跟着所有者一起挪的其它顶层窗口（例如蒙版）。
+    follow_windows: RefCell<Vec<HWND>>,
+}
+
+/// 一次 dialog 拖拽的起点。
+#[derive(Debug, Clone, Copy)]
+struct DialogDrag {
+    cursor: (i32, i32),
+    dialog: (i32, i32),
+    owner: (i32, i32),
+}
+
+/// 拖动超过几个像素才算拖拽（与脚本窗口一致）。
+const DRAG_THRESHOLD: i32 = 4;
+
+/// 上次画出来的那一幅：位置 `(x, y)` + 内容尺寸 + 版面版本 + 渲染器代号。
+type Painted = (i32, i32, i32, i32, u64, u64);
+
+impl AuxiliaryWindowTemplate {
+    /// 建一个隐藏的模板窗口。`able_to_get_focus` = 这件资产创建时**声明**自己允不允许获取焦点
+    /// （见 [`super::auxiliary::Asset::able_to_get_focus`]）；`false`（缺省）时永远不接输入。
+    /// 声明了也只是「能」—— 创建之后的焦点仍在所有者手上，直到所有者**指定**给它。失败返回 `Err`，
+    /// 调用方降级为不显示。
+    ///
+    /// `owner` 是宿主独立窗口的句柄：给了就建它的 **owned window**，辅助窗口在屏幕上始终排在所有者上层
+    /// （模态也靠这条关系，见 [`Self::set_modal`]）。内部面板（键位映射参考）可以给 `None`。
+    pub fn new(
+        painter: SharedPainter,
+        able_to_get_focus: bool,
+        owner: Option<HWND>,
+    ) -> Result<Self> {
+        CLASS.ensure(|| WNDCLASSEXW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: module_handle(),
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+            lpszClassName: CLASS_NAME,
+            ..Default::default()
+        })?;
+        // TRANSPARENT：现在还只是一块空面板，鼠标点它等于点在底下的应用上。NOACTIVATE：不抢焦点。
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                CLASS_NAME,
+                w!("云朵辅助窗口"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                owner,
+                None,
+                Some(module_handle()),
+                None,
+            )?
+        };
+        Ok(Self {
+            hwnd,
+            kind: AssetKind::Auxiliary,
+            mask: None,
+            mask_applied: Cell::new(false),
+            previous_mask: Cell::new(None),
+            modal: Cell::new(false),
+            focusable: able_to_get_focus,
+            focused: Cell::new(false),
+            painter,
+            dpi: Cell::new(unsafe { GetDpiForSystem() }.max(96)),
+            spec: Cell::new(AuxiliaryWindowSpec::default()),
+            content: RefCell::new(Content::Empty),
+            events: RefCell::new(None),
+            hits: RefCell::new(Vec::new()),
+            regions: RefCell::new(Vec::new()),
+            control_names: RefCell::new(Vec::new()),
+            hover: Cell::new(None),
+            last: Cell::new((0, 0)),
+            scale: Cell::new(1.0),
+            margin: Cell::new(0),
+            shadow: Cell::new(true),
+            background: Cell::new(true),
+            placed: Cell::new(None),
+            revision: Cell::new(0),
+            painted: Cell::new(None),
+            owner,
+            drag: Cell::new(None),
+            dragged: Cell::new(false),
+            follow_hosts: RefCell::new(Vec::new()),
+            follow_windows: RefCell::new(Vec::new()),
+        })
+    }
+
+    /// 建一个**内置对话框**（`AssetKind::Dialog`）：创建即由 `Assets::add` 压入模态栈顶，
+    /// 生命周期内不能取消模态。正文内容暂时留空（`Content::Empty`），按具体 dialog 种类再补。
+    pub fn dialog(painter: SharedPainter, owner: HWND, options: DialogOptions) -> Result<Self> {
+        let mut template = Self::new(painter, true, Some(owner))?;
+        template.kind = AssetKind::Dialog;
+        template.set_top_most(true);
+        if options.mask {
+            template.mask = Some(WindowMask::dim(0.35));
+        }
+        Ok(template)
+    }
+
+    /// 资产种类：普通辅助窗口 / 内置对话框。
+    pub fn kind(&self) -> AssetKind {
+        self.kind
+    }
+
+    /// 对话框要求开蒙版时，第一次 `sync` 记下所有者原来的蒙版并切过去。
+    pub fn apply_mask(&self, owner: &dyn Bridge) {
+        let Some(mask) = self.mask else {
+            return;
+        };
+        if self.mask_applied.replace(true) {
+            return;
+        }
+        self.previous_mask.set(owner.mask());
+        owner.set_mask(Some(mask));
+    }
+
+    /// 对话框销毁前恢复所有者原来的蒙版。
+    pub fn restore_mask(&self, owner: &dyn Bridge) {
+        if self.mask_applied.replace(false) {
+            owner.set_mask(self.previous_mask.get());
+            self.previous_mask.set(None);
+        }
+    }
+
+    /// 把自己登记进本线程的表，窗口过程按 HWND 找回它（`Weak`：不续命，`Drop` 之后自然没了）。
+    pub fn attach(self: &Rc<Self>) {
+        REGISTRY.with(|map| {
+            map.borrow_mut()
+                .insert(self.hwnd.0 as isize, Rc::downgrade(self));
+        });
+    }
+
+    /// 这块面板自己的窗口句柄。
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    /// 最近一帧位图四周的阴影留白（像素）；内容区左上角 = 窗口左上角 + 它。
+    pub fn margin(&self) -> i32 {
+        self.margin.get()
+    }
+
+    /// 置顶开关；缺省不置顶（`new` 不写 `WS_EX_TOPMOST`）。
+    pub fn set_top_most(&self, top_most: bool) {
+        let insert_after = if top_most {
+            Some(HWND_TOPMOST)
+        } else {
+            Some(HWND_NOTOPMOST)
+        };
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                insert_after,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// 设三个属性（物理像素）；`None` 的项回到默认算法。
+    pub fn set_spec(&self, spec: AuxiliaryWindowSpec) {
+        self.spec.set(spec);
+    }
+
+    /// 设置 / 取消**模态**（由所有者经 [`super::auxiliary::Assets::set_modal`] 调）。
+    ///
+    /// 打开时把这件资产重新提到最前 —— 所有者可能刚抬过自己的 RichEdit 宿主或别的资产；
+    /// 辅助窗口本身是宿主的 owned window（见 [`Self::new`]），所以**始终排在所有者上层**。
+    /// 关掉时只改状态，不改变 z-order 关系（辅助窗口本来就该在所有者上面）。
+    pub fn set_modal(&self, modal: bool) {
+        if self.modal.replace(modal) == modal {
+            return;
+        }
+        if modal {
+            self.raise_above_owner();
+        }
+        tracing::debug!(modal, "辅助窗口模板：模态开关");
+    }
+
+    /// 把窗口提到最前（模态资产在所有者抬了别的窗口之后重新露头时用）。
+    pub fn raise(&self) {
+        self.raise_above_owner();
+    }
+
+    fn raise_above_owner(&self) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// 换面板里要画的脚本内容（`cloudime.window.create_auxiliary` + `set_content`）。
+    pub fn set_document(&self, document: cloudime_render::Document) {
+        *self.control_names.borrow_mut() = document.control_names.clone();
+        *self.content.borrow_mut() = Content::Document(document);
+        self.revision.set(self.revision.get() + 1);
+    }
+
+    /// 更新静态 `label` / `text_block` 的文字；只影响内容，不重建窗口。
+    pub fn update_static_content(&self, name: &str, content: StaticTextContent) -> bool {
+        let mut document = self.content.borrow_mut();
+        let Content::Document(document) = &mut *document else {
+            tracing::warn!("辅助窗口：只有脚本内容才能更新静态文本");
+            return false;
+        };
+        if !document.update_static_content(name, content) {
+            tracing::warn!(control = name, "辅助窗口：名字或内容类型不匹配");
+            return false;
+        }
+        self.revision.set(self.revision.get() + 1);
+        true
+    }
+
+    /// 改一个扁平 SVG 按钮的背景色；只影响内容，不重建窗口。
+    pub fn set_button_background(&self, name: &str, color: Color) -> bool {
+        let mut document = self.content.borrow_mut();
+        let Content::Document(document) = &mut *document else {
+            tracing::warn!("辅助窗口：只有脚本内容才能改按钮颜色");
+            return false;
+        };
+        if !document.set_button_background(name, color) {
+            tracing::warn!(control = name, "辅助窗口：按钮名字或类型不匹配");
+            return false;
+        }
+        self.revision.set(self.revision.get() + 1);
+        true
+    }
+
+    /// 动态改一个区域的命中范围（合并 / 剪除）：只影响鼠标命中，不重画。
+    pub fn edit_region(&self, name: &str, shape: cloudime_render::HitShape, combine: bool) {
+        let mut content = self.content.borrow_mut();
+        let Content::Document(document) = &mut *content else {
+            tracing::warn!("窗口模板：只有脚本内容才有区域");
+            return;
+        };
+        let Some(region) = document
+            .regions
+            .iter_mut()
+            .find(|region| region.name == name)
+        else {
+            tracing::warn!(region = name, "窗口模板：改区域时找不到它");
+            return;
+        };
+        if combine {
+            region.combine(shape);
+        } else {
+            region.prune(shape);
+        }
+        // 鼠标命中用的是模板自己那份，跟着内容走
+        *self.regions.borrow_mut() = document.regions.clone();
+    }
+
+    /// 要不要阴影（脚本 `shadow = false` 时关掉）。
+    pub fn set_shadow(&self, shadow: bool) {
+        self.shadow.set(shadow);
+        self.revision.set(self.revision.get() + 1);
+    }
+
+    /// 要不要画窗口面板背景（主题底色 + 圆角）。消息对话框自己画整块背景时关掉。
+    pub fn set_background(&self, background: bool) {
+        self.background.set(background);
+        self.revision.set(self.revision.get() + 1);
+    }
+
+    /// 装鼠标事件出口（脚本辅助窗口用；键位映射参考不装，鼠标一律穿透）。
+    pub fn set_events(&self, events: PanelEvents) {
+        *self.events.borrow_mut() = Some(events);
+    }
+
+    /// 客户区坐标 → 内容区坐标（点）+ 命中的元素（1 起）+ 区域下标（0 起）。
+    fn hit_at(&self, client_x: i32, client_y: i32) -> (f32, f32, Option<usize>, Option<usize>) {
+        let scale = self.scale.get().max(0.01);
+        let margin = self.margin.get();
+        // 窗口左上角 = 内容左上角 - 留白；客户区 0 点在位图 0 点，所以内容像素 = 客户区 - 留白
+        let x = (client_x - margin) as f32 / scale;
+        let y = (client_y - margin) as f32 / scale;
+        let element = self
+            .hits
+            .borrow()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, hit)| {
+                hit.as_ref()
+                    .filter(|hit| hit.contains(x, y))
+                    .map(|_| index + 1)
+            });
+        let region = crate::region::hit(&self.regions.borrow(), x, y);
+        (x, y, element, region)
+    }
+
+    /// 指定 dialog 拖拽时要跟着所有者一起挪的窗口：RichEdit 宿主与其它顶层窗口（蒙版）。
+    pub(crate) fn set_owner_followers(&self, hosts: Vec<Rc<TextHostWindow>>, windows: Vec<HWND>) {
+        *self.follow_hosts.borrow_mut() = hosts;
+        *self.follow_windows.borrow_mut() = windows;
+    }
+
+    /// 让一个额外顶层窗口跟着 dialog 平移（文本输入对话框自己的编辑框宿主）。
+    pub(crate) fn follow_edit_host(&self, host: Rc<TextHostWindow>) {
+        self.follow_hosts.borrow_mut().push(host);
+    }
+
+    /// dialog 拖拽：按下时记起点；按在按钮 / 区域上留给点击，不拖窗口。
+    fn begin_drag(&self, client_x: i32, client_y: i32) {
+        if self.kind != AssetKind::Dialog {
+            return;
+        }
+        let Some(owner) = self.owner else {
+            return;
+        };
+        if self.hit_at(client_x, client_y).3.is_some() {
+            return;
+        }
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
+        self.drag.set(Some(DialogDrag {
+            cursor: (cursor.x, cursor.y),
+            dialog: window_origin(self.hwnd),
+            owner: window_origin(owner),
+        }));
+        self.dragged.set(false);
+        unsafe {
+            SetCapture(self.hwnd);
+        }
+    }
+
+    /// 拖拽中：超过阈值后把对话框和所有者一起挪同样的位移。
+    fn drag_to(&self) {
+        let Some(drag) = self.drag.get() else {
+            return;
+        };
+        let Some(owner) = self.owner else {
+            return;
+        };
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
+        let dx = cursor.x - drag.cursor.0;
+        let dy = cursor.y - drag.cursor.1;
+        if !self.dragged.get() && dx.abs().max(dy.abs()) < DRAG_THRESHOLD {
+            return;
+        }
+        self.dragged.set(true);
+        let target = (drag.dialog.0 + dx, drag.dialog.1 + dy);
+        let before = window_origin(self.hwnd);
+        move_window(self.hwnd, target.0, target.1);
+        let (step_x, step_y) = (target.0 - before.0, target.1 - before.1);
+        // RichEdit 宿主 / 蒙版都是独立顶层窗口，不会跟着 dialog 或所有者移动。
+        for host in self.follow_hosts.borrow().iter() {
+            host.move_by(step_x, step_y);
+        }
+        for hwnd in self.follow_windows.borrow().iter() {
+            let (x, y) = window_origin(*hwnd);
+            move_window(*hwnd, x + step_x, y + step_y);
+        }
+        if unsafe { IsWindow(Some(owner)) }.as_bool() {
+            move_window(owner, drag.owner.0 + dx, drag.owner.1 + dy);
+        }
+    }
+
+    /// 结束拖拽；返回这一按有没有真的拖动过（拖动过就不再派点击）。
+    fn end_drag(&self) -> bool {
+        let dragged = self.dragged.replace(false);
+        self.drag.set(None);
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        dragged
+    }
+
+    /// 把一次鼠标动作交给出口（没装出口就什么也不做）。
+    fn emit(&self, action: PanelAction, client_x: i32, client_y: i32, delta: Option<i32>) {
+        let (x, y, element, region) = self.hit_at(client_x, client_y);
+        let (region, handler) = region
+            .and_then(|index| {
+                let regions = self.regions.borrow();
+                let region = regions.get(index)?;
+                Some((
+                    Some(region.name.clone()),
+                    region.handler(action.as_str()).map(str::to_owned),
+                ))
+            })
+            .unwrap_or((None, None));
+        let control = element.and_then(|element| {
+            let index = element.checked_sub(1)?;
+            self.control_names
+                .borrow()
+                .iter()
+                .find(|control| control.path.len() == 1 && control.path[0] == index)
+                .map(|control| control.name.clone())
+        });
+        if let Some(events) = self.events.borrow().as_ref() {
+            events(PanelEvent {
+                action,
+                x,
+                y,
+                element,
+                region,
+                control,
+                handler,
+                delta,
+            });
+        }
+    }
+
+    /// 鼠标移动：只有停到**另一个元素 / 区域**上才派一次 `hover`（同一元素里挪不重复派）。
+    fn emit_move(&self, client_x: i32, client_y: i32) {
+        self.last.set((client_x, client_y));
+        let (_, _, element, region) = self.hit_at(client_x, client_y);
+        let key = (element, region);
+        if self.hover.replace(Some(key)) == Some(key) {
+            return;
+        }
+        if element.is_some() || region.is_some() {
+            self.emit(PanelAction::Hover, client_x, client_y, None);
+        }
+    }
+
+    /// 鼠标离开窗口：派一次 `leave`（带着离开前的位置）。
+    fn emit_leave(&self) {
+        self.hover.set(None);
+        let (x, y) = self.last.get();
+        self.emit(PanelAction::Leave, x, y, None);
+    }
+
+    /// 创建时声明的 `able_to_get_focus`。
+    pub fn focusable(&self) -> bool {
+        self.focusable
+    }
+
+    /// 焦点**指定**给它 / 从它手上收回（由所有者驱动，见 [`super::auxiliary::Focus`]）：
+    /// 有焦点才接鼠标（那会儿去掉鼠标穿透），没有就一律穿透到下面的窗口。
+    ///
+    /// 没声明 `able_to_get_focus` 的面板不会被打开输入（只记一条日志 —— 那说明调用方写错了，
+    /// 或者所有者没照 [`super::auxiliary::Assets::designate_focus`] 的规矩来）。
+    pub fn set_focused(&self, focused: bool) {
+        if focused && !self.focusable {
+            tracing::warn!("窗口模板：这件资产创建时没声明 able_to_get_focus，不接输入");
+            return;
+        }
+        if self.focused.replace(focused) == focused {
+            return;
+        }
+        // 鼠标穿透就靠那一个位：窗口过程那边的命中测试也读它（两边同一个来源）
+        set_mouse_transparent(self.hwnd, !focused);
+        tracing::debug!(focused, "窗口模板：鼠标输入开关");
+    }
+
+    /// 贴在候选窗口的内容矩形旁边显示：`layout` 决定贴右侧（竖排）还是下方（横排）。
+    pub fn show(&self, candidate: RECT, layout: LayoutMode) {
+        self.show_with(candidate, layout, Placement::Beside);
+    }
+
+    /// 在宿主内容区矩形里居中显示（消息对话框等同步面板用）。
+    pub fn show_centered(&self, candidate: RECT, layout: LayoutMode) {
+        self.show_with(candidate, layout, Placement::Centered);
+    }
+
+    fn show_with(&self, candidate: RECT, layout: LayoutMode, placement: Placement) {
+        let point = POINT {
+            x: candidate.left,
+            y: candidate.top,
+        };
+        let dpi = monitor::dpi_near(point)
+            .or_else(|| {
+                let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+                (dpi != 0).then_some(dpi)
+            })
+            .unwrap_or(self.dpi.get())
+            .max(1);
+        self.dpi.set(dpi);
+        let spec = self.spec.get();
+        // 出图：脚本内容 / 空面板，二选一
+        let (rendered, hits, regions, generation) = {
+            let content = self.content.borrow();
+            let mut painter = self.painter.borrow_mut();
+            let Some(painter) = painter.as_mut() else {
+                tracing::warn!("窗口模板：渲染器没起来，不显示");
+                self.hide();
+                return;
+            };
+            let generation = painter.generation();
+            match &*content {
+                Content::Document(document) => {
+                    let rendered = painter.render_document(
+                        document,
+                        dpi,
+                        self.shadow.get(),
+                        self.background.get(),
+                    );
+                    let hits = rendered
+                        .as_ref()
+                        .map(|rendered| rendered.hits.clone())
+                        .unwrap_or_default();
+                    let regions = document.regions.clone();
+                    (
+                        rendered.map(|rendered| rendered.rendered),
+                        hits,
+                        regions,
+                        generation,
+                    )
+                }
+                _ => {
+                    let (default_width, default_height) = default_size(painter, layout, dpi);
+                    let content = (
+                        spec.width.unwrap_or(default_width).max(1),
+                        spec.height.unwrap_or(default_height).max(1),
+                    );
+                    (
+                        painter.render_panel(content, dpi),
+                        Vec::new(),
+                        Vec::new(),
+                        generation,
+                    )
+                }
+            }
+        };
+        let Some(rendered) = rendered else {
+            tracing::warn!("窗口模板：渲染器画不出来，不显示");
+            self.hide();
+            return;
+        };
+        let content = (
+            rendered.content_width as i32,
+            rendered.content_height as i32,
+        );
+        let gap = spec.gap.unwrap_or((DEFAULT_GAP * dpi as i32) / 96);
+        let (x, y) = match placement {
+            Placement::Beside => place(candidate, content, gap, layout),
+            Placement::Centered => centered(candidate, content),
+        };
+        // 位置 / 尺寸 / 版面 / 渲染器都没变：窗口里已经是这一幅，不重贴
+        let revision = self.revision.get();
+        let signature = (x, y, content.0, content.1, revision, generation);
+        if self.painted.get() == Some(signature) {
+            return;
+        }
+        // 位图四周还有阴影留白，摆的是内容左上角，贴图位置要把留白减掉。
+        let margin = rendered.content_x as i32;
+        if let Err(error) =
+            layered::present(self.hwnd, &rendered.pixmap, (x - margin, y - margin), 255)
+        {
+            tracing::warn!(%error, "窗口模板：贴图失败，不显示");
+            self.hide();
+            return;
+        }
+        *self.hits.borrow_mut() = hits;
+        *self.regions.borrow_mut() = regions;
+        self.scale.set(rendered.scale.max(0.01));
+        self.margin.set(margin);
+        let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNA) };
+        if self.modal.get() {
+            // 显示动作可能把它压到刚建 / 刚抬起的宿主窗下面：模态窗口必须回到最前
+            self.raise_above_owner();
+        }
+        self.painted.set(Some(signature));
+        // 从「没显示」到「显示」记一条：排查「按了键没看见」时看它就知道摆到哪去了。
+        if self.placed.get().is_none() {
+            tracing::info!(
+                x,
+                y,
+                width = content.0,
+                height = content.1,
+                gap,
+                dpi,
+                layout = ?layout,
+                "窗口模板已摆出"
+            );
+        }
+        self.placed.set(Some((x, y, content.0, content.1)));
+    }
+
+    /// 收起（没显示过也无妨）。
+    pub fn hide(&self) {
+        // 收起来之后窗口内容就不作数了：下次显示重画
+        self.painted.set(None);
+        self.hits.borrow_mut().clear();
+        self.regions.borrow_mut().clear();
+        if self.placed.replace(None).is_some() {
+            let _ = unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+            tracing::info!("窗口模板已收起");
+        }
+    }
+}
+
+/// 按候选窗口的形状算默认大小（物理像素）。
+fn default_size(painter: &mut Painter, layout: LayoutMode, dpi: u32) -> (i32, i32) {
+    let (width, height) = match layout {
+        LayoutMode::Vertical => painter.candidate_size(Layout::Vertical, VERTICAL_ROWS, dpi),
+        LayoutMode::Horizontal => painter.candidate_size(Layout::Horizontal, HORIZONTAL_ROWS, dpi),
+    };
+    match layout {
+        // 竖排：高度对齐「9 个候选项」，宽度取它的 √2 倍（向下取整）
+        LayoutMode::Vertical => {
+            let height = height.max(1);
+            ((height as f32 * std::f32::consts::SQRT_2) as i32, height)
+        }
+        // 横排：宽度对齐「6 个两字候选」，高度取它的 √5 倍（向下取整）
+        LayoutMode::Horizontal => {
+            let width = width.max(1);
+            (width, (width as f32 * 5.0_f32.sqrt()) as i32)
+        }
+    }
+}
+
+impl Drop for AuxiliaryWindowTemplate {
+    fn drop(&mut self) {
+        REGISTRY.with(|map| {
+            map.borrow_mut().remove(&(self.hwnd.0 as isize));
+        });
+        let _ = unsafe { DestroyWindow(self.hwnd) };
+    }
+}
+
+/// 在宿主矩形里居中，最后夹进工作区。
+fn centered(owner: RECT, content: (i32, i32)) -> (i32, i32) {
+    let work = monitor::work_area_near(POINT {
+        x: owner.left,
+        y: owner.top,
+    });
+    center_in(work, owner, content)
+}
+
+/// [`centered`] 的纯函数部分（工作区给死，便于单测）。
+fn center_in(work: RECT, owner: RECT, content: (i32, i32)) -> (i32, i32) {
+    let clamp_x = |x: i32| x.clamp(work.left, (work.right - content.0).max(work.left));
+    let clamp_y = |y: i32| y.clamp(work.top, (work.bottom - content.1).max(work.top));
+    let x = (owner.left + owner.right - content.0) / 2;
+    let y = (owner.top + owner.bottom - content.1) / 2;
+    (clamp_x(x), clamp_y(y))
+}
+
+/// 内容左上角：按**候选窗口矩形中心点**所在的半屏往另一边摆 ——
+///
+/// - 竖排：中心在屏幕（工作区）**右半边** → 贴候选窗**左侧**；在**左半边** → 贴**右侧**；
+/// - 横排：中心在**下半边** → 贴**上方**；在**上半边** → 贴**下方**。
+///
+/// 这样两个窗口总是往屏幕里侧靠，不会贴到边上被挤掉。贴出去的位置最后统一夹进工作区。
+fn place(candidate: RECT, content: (i32, i32), gap: i32, layout: LayoutMode) -> (i32, i32) {
+    let work = monitor::work_area_near(POINT {
+        x: candidate.left,
+        y: candidate.top,
+    });
+    place_in(work, candidate, content, gap, layout)
+}
+
+/// [`place`] 的纯函数部分（工作区给死，便于单测）。
+fn place_in(
+    work: RECT,
+    candidate: RECT,
+    content: (i32, i32),
+    gap: i32,
+    layout: LayoutMode,
+) -> (i32, i32) {
+    let clamp_x = |x: i32| x.clamp(work.left, (work.right - content.0).max(work.left));
+    let clamp_y = |y: i32| y.clamp(work.top, (work.bottom - content.1).max(work.top));
+    let center_x = (candidate.left + candidate.right) / 2;
+    let center_y = (candidate.top + candidate.bottom) / 2;
+    match layout {
+        LayoutMode::Vertical => {
+            let x = if center_x > work.left + (work.right - work.left) / 2 {
+                candidate.left - gap - content.0
+            } else {
+                candidate.right + gap
+            };
+            (clamp_x(x), clamp_y(candidate.top))
+        }
+        LayoutMode::Horizontal => {
+            let y = if center_y > work.top + (work.bottom - work.top) / 2 {
+                candidate.top - gap - content.1
+            } else {
+                candidate.bottom + gap
+            };
+            (clamp_x(candidate.left), clamp_y(y))
+        }
+    }
+}
+
+/// 分层窗口无需 `WM_PAINT`；内容由 [`AuxiliaryWindowTemplate::show`] 出图后整块贴上。
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        // 没焦点（缺省）时窗口带着 `WS_EX_TRANSPARENT`：鼠标一律穿透到下面的窗口。
+        // 命中测试照那个位回答 —— 与 `set_focused` 同一个来源，两边不会打架。
+        WM_NCHITTEST => {
+            let transparent = mouse_transparent(hwnd);
+            LRESULT(if transparent {
+                HTTRANSPARENT as isize
+            } else {
+                HTCLIENT as isize
+            })
+        }
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        // 光标：编辑框宿主自己管 I 型光标；面板其余地方（以及鼠标从宿主移回面板时）
+        // 一律恢复箭头，避免一直停在 I 型。
+        WM_SETCURSOR => {
+            if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+                if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+                    unsafe {
+                        let _ = SetCursor(Some(cursor));
+                    }
+                }
+                return LRESULT(1);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        // 装了事件出口（脚本辅助窗口）才把鼠标动作送出去；键位映射参考没装，这些消息就当没看见。
+        WM_MOUSEMOVE => {
+            track_leave(hwnd);
+            with_template(hwnd, |template| {
+                template.drag_to();
+                template.emit_move(client_x(lparam), client_y(lparam));
+            });
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_template(hwnd, AuxiliaryWindowTemplate::emit_leave);
+            LRESULT(0)
+        }
+        // dialog：按在非区域处开始拖拽（连同所有者一起挪）。
+        WM_LBUTTONDOWN => {
+            with_template(hwnd, |template| {
+                template.begin_drag(client_x(lparam), client_y(lparam));
+            });
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let mut dragged = false;
+            with_template(hwnd, |template| {
+                dragged = template.end_drag();
+            });
+            if !dragged {
+                with_template(hwnd, |template| {
+                    template.emit(PanelAction::Click, client_x(lparam), client_y(lparam), None);
+                });
+            }
+            LRESULT(0)
+        }
+        // 捕获被别处拿走：这一次拖拽就作废，别留着旧起点。
+        WM_CAPTURECHANGED => {
+            with_template(hwnd, |template| {
+                template.drag.set(None);
+                template.dragged.set(false);
+            });
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            with_template(hwnd, |template| {
+                template.emit(
+                    PanelAction::RightClick,
+                    client_x(lparam),
+                    client_y(lparam),
+                    None,
+                );
+            });
+            LRESULT(0)
+        }
+        // 滚轮的坐标在 `lparam` 里是**屏幕**坐标（与鼠标移动不同），先换算成客户区。
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+            let mut point = POINT {
+                x: client_x(lparam),
+                y: client_y(lparam),
+            };
+            let _ = unsafe { ScreenToClient(hwnd, &mut point) };
+            with_template(hwnd, |template| {
+                template.emit(PanelAction::Wheel, point.x, point.y, Some(delta));
+            });
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// 窗口左上角的屏幕坐标（物理像素）。
+fn window_origin(hwnd: HWND) -> (i32, i32) {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut rect);
+    }
+    (rect.left, rect.top)
+}
+
+/// 只挪位置：不动尺寸 / z-order，也不激活。
+fn move_window(hwnd: HWND, x: i32, y: i32) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// 客户区坐标：`lparam` 低 16 位是 x、高 16 位是 y（带符号）。
+fn client_x(lparam: LPARAM) -> i32 {
+    (lparam.0 & 0xFFFF) as u16 as i16 as i32
+}
+
+fn client_y(lparam: LPARAM) -> i32 {
+    ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32
+}
+
+/// 让窗口在鼠标离开时收到一条 `WM_MOUSELEAVE`（每次移动调一次，系统自己只报一次）。
+fn track_leave(hwnd: HWND) {
+    let mut event = TRACKMOUSEEVENT {
+        cbSize: core::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    let _ = unsafe { TrackMouseEvent(&mut event) };
+}
+
+/// 按 HWND 找回本线程的模板（`Weak` 升级不上来就什么也不做）。
+fn with_template(hwnd: HWND, act: impl FnOnce(&AuxiliaryWindowTemplate)) {
+    let template =
+        REGISTRY.with(|map| map.borrow().get(&(hwnd.0 as isize)).and_then(Weak::upgrade));
+    if let Some(template) = template {
+        act(&template);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{center_in, place_in};
+    use cloud_ui_types::LayoutMode;
+    use windows::Win32::Foundation::RECT;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn centered_panels_sit_in_the_middle_of_the_owner() {
+        let work = rect(0, 0, 800, 600);
+        let owner = rect(100, 100, 500, 300);
+        assert_eq!(center_in(work, owner, (200, 100)), (200, 150));
+        // 靠近屏幕边缘时夹回工作区
+        assert_eq!(center_in(work, rect(0, 0, 100, 100), (300, 200)), (0, 0));
+    }
+
+    /// 竖排：候选窗中心在屏幕**左半边**贴右侧、在**右半边**贴左侧 —— 总往屏幕里侧靠。
+    #[test]
+    fn vertical_goes_to_the_other_side_of_the_screen_half() {
+        let work = rect(0, 0, 1920, 1080);
+        // 中心 x = 250（左半边）→ 贴右侧（400 + 16）
+        assert_eq!(
+            place_in(
+                work,
+                rect(100, 100, 400, 400),
+                (200, 300),
+                16,
+                LayoutMode::Vertical
+            ),
+            (416, 100),
+            "左半边 → 贴右侧"
+        );
+        // 中心 x = 1750（右半边）→ 贴左侧（1600 − 16 − 200）
+        assert_eq!(
+            place_in(
+                work,
+                rect(1600, 100, 1900, 400),
+                (200, 300),
+                16,
+                LayoutMode::Vertical
+            ),
+            (1384, 100),
+            "右半边 → 贴左侧"
+        );
+    }
+
+    /// 横排：候选窗中心在**上半边**贴下方、在**下半边**贴上方。
+    #[test]
+    fn horizontal_goes_to_the_other_side_of_the_screen_half() {
+        let work = rect(0, 0, 1920, 1080);
+        // 中心 y = 150（上半边）→ 贴下方（200 + 16）
+        assert_eq!(
+            place_in(
+                work,
+                rect(100, 100, 400, 200),
+                (300, 200),
+                16,
+                LayoutMode::Horizontal
+            ),
+            (100, 216),
+            "上半边 → 贴下方"
+        );
+        // 中心 y = 950（下半边）→ 贴上方（900 − 16 − 200）
+        assert_eq!(
+            place_in(
+                work,
+                rect(100, 900, 400, 1000),
+                (300, 200),
+                16,
+                LayoutMode::Horizontal
+            ),
+            (100, 684),
+            "下半边 → 贴上方"
+        );
+    }
+
+    /// 贴出去的内容始终夹在工作区里（候选窗贴着屏幕边时也一样）。
+    #[test]
+    fn the_window_stays_inside_the_work_area() {
+        let work = rect(0, 0, 800, 600);
+        let (x, y) = place_in(
+            work,
+            rect(700, 560, 800, 610),
+            (400, 300),
+            16,
+            LayoutMode::Vertical,
+        );
+        assert!(x >= work.left && x + 400 <= work.right, "x={x}");
+        assert!(y >= work.top && y + 300 <= work.bottom, "y={y}");
+    }
+}

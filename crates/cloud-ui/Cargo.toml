@@ -1,0 +1,36 @@
+﻿[package]
+name = "cloud-ui"
+description = "Windows 自绘窗口壳：分层窗口、辅助窗口、内置对话框与 RichEdit 宿主"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cloud-ui-core.workspace = true
+cloud-ui-types.workspace = true
+cloudime-render.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[target."cfg(windows)".dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_RichEdit",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_TextServices",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# `#[implement]` 展开会引用 `::windows_core`，需要直接依赖。
+windows-core.workspace = true
+
+[lints]
+workspace = true
