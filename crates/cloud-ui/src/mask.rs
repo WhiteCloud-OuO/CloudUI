@@ -7,7 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use cloudime_render::{Color, Pixmap, rounded_rect_pixmap};
+use cloud_ui_render::{Color, Pixmap, rounded_rect_pixmap};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, HTTRANSPARENT, HWND_TOP, HWND_TOPMOST,

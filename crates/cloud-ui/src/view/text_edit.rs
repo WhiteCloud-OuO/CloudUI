@@ -1,10 +1,10 @@
 //! 单行 / 多行文本编辑框：`View` 里的外观参数。
 //!
 //! 文字本身由窗口层的 windowless RichEdit 宿主绘制与编辑（见 `cloud_ui::text_edit`）；
-//! 这里只生成 [`cloudime_render::Element::TextEdit`] / [`cloudime_render::Element::TextBox`]，
+//! 这里只生成 [`cloud_ui_render::Element::TextEdit`] / [`cloud_ui_render::Element::TextBox`]，
 //! 宿主按 `region_name` 与它对齐。文本内容仍由应用保存，输入变化通过 `AppEvent::TextChanged` 交回。
 
-use cloudime_render::{
+use cloud_ui_render::{
     Color, Element, FontSlot, SvgAlign, TextBox as TextBoxElement, TextBoxScroll,
     TextEdit as TextEditElement,
 };

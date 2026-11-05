@@ -3,7 +3,7 @@
 //! 所有对话框都是同一套三段式：标题栏 / 内容区 / 按钮组。尺寸与排版只在这里定义一份，
 //! 具体对话框只描述内容区里放什么。
 
-use cloudime_render::{Color, Element, FontSlot, HitShape, Region, TextBlock};
+use cloud_ui_render::{Color, Element, FontSlot, HitShape, Region, TextBlock};
 
 use crate::painter::Painter;
 use crate::view::{ButtonStyle, TitleBarStyle};

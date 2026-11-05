@@ -3,7 +3,7 @@
 //! 所有内置对话框都是类：`new` 建实例，属性在 `show` 之前改，`show(self)` 吃掉实例。
 //! 颜色和字号只在这里定义一份，消息对话框与文本输入对话框共用。
 
-use cloudime_render::{Color, FontSlot};
+use cloud_ui_render::{Color, FontSlot};
 
 use crate::view::Theme;
 

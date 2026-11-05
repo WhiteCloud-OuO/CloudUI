@@ -9,7 +9,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::painter::SharedPainter;
 use crate::text_edit::TextHostWindow;
-use cloudime_render::Color;
+use cloud_ui_render::Color;
 
 /// 当前正在处理 UI 工作的独立窗口。
 #[derive(Clone)]

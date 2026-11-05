@@ -5,12 +5,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cloud_ui_types::LayoutMode;
-use cloudime_render::{
+use cloud_ui_render::{
     CandidateView, Color, Document, Element, FontLibrary, FontSlot, FontSpec, Layout, Palette,
     Preedit, Rendered, RenderedStatus, Renderer, Row, Shadow, StatusCell, Theme, UiFont,
     system_fonts,
 };
+use cloud_ui_types::LayoutMode;
 
 use cloud_ui_core::{
     Align, Axis, Constraints, Edges, Justify, LayoutSpec, Node, NodeKind, NoopMeasure, PageTree,
@@ -257,7 +257,7 @@ impl Painter {
     /// 画一块「键位映射参考」面板（版面给进来，内容区尺寸由版面自己定）：给「窗口模板」用。
     pub fn render_key_map(
         &mut self,
-        layout: &cloudime_render::KeyMapLayout,
+        layout: &cloud_ui_render::KeyMapLayout,
         cell: f32,
         dpi: u32,
     ) -> Option<Rendered> {
@@ -277,11 +277,11 @@ impl Painter {
     /// 给「辅助窗口模板」与脚本独立窗口用。
     pub fn render_document(
         &mut self,
-        document: &cloudime_render::Document,
+        document: &cloud_ui_render::Document,
         dpi: u32,
         shadow: bool,
         background: bool,
-    ) -> Option<cloudime_render::RenderedDocument> {
+    ) -> Option<cloud_ui_render::RenderedDocument> {
         self.renderer
             .render_document(
                 document,
@@ -489,8 +489,8 @@ fn scale(dpi: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{Painter, StatusKind};
+    use cloud_ui_render::StatusCell;
     use cloud_ui_types::ItemNumberStyle;
-    use cloudime_render::StatusCell;
 
     fn settings() -> crate::RenderSettings {
         crate::RenderSettings {

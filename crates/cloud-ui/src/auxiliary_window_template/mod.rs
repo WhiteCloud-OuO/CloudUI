@@ -44,8 +44,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, Result, w};
 
+use cloud_ui_render::{Color, ControlName, Layout, StaticTextContent};
 use cloud_ui_types::LayoutMode;
-use cloudime_render::{Color, ControlName, Layout, StaticTextContent};
 
 use crate::WindowMask;
 use crate::auxiliary::Bridge;
@@ -112,7 +112,7 @@ enum Content {
     Empty,
 
     /// 脚本给的一份内容（`cloudime.window.create_auxiliary` + `set_content`）。
-    Document(cloudime_render::Document),
+    Document(cloud_ui_render::Document),
 }
 
 /// 面板摆在宿主旁边还是居中盖在宿主上。
@@ -203,10 +203,10 @@ pub struct AuxiliaryWindowTemplate {
     events: RefCell<Option<PanelEvents>>,
 
     /// 最近一帧每个元素的命中区域（内容区坐标，点）：脚本辅助窗口的鼠标事件用。
-    hits: RefCell<Vec<Option<cloudime_render::HitShape>>>,
+    hits: RefCell<Vec<Option<cloud_ui_render::HitShape>>>,
 
     /// 脚本内容里声明的区域（点击 / 拖拽范围）。
-    regions: RefCell<Vec<cloudime_render::Region>>,
+    regions: RefCell<Vec<cloud_ui_render::Region>>,
 
     /// 脚本内容里的控件名（布局文件）：事件里给 `control`。
     control_names: RefCell<Vec<ControlName>>,
@@ -455,7 +455,7 @@ impl AuxiliaryWindowTemplate {
     }
 
     /// 换面板里要画的脚本内容（`cloudime.window.create_auxiliary` + `set_content`）。
-    pub fn set_document(&self, document: cloudime_render::Document) {
+    pub fn set_document(&self, document: cloud_ui_render::Document) {
         *self.control_names.borrow_mut() = document.control_names.clone();
         *self.content.borrow_mut() = Content::Document(document);
         self.revision.set(self.revision.get() + 1);
@@ -492,7 +492,7 @@ impl AuxiliaryWindowTemplate {
     }
 
     /// 动态改一个区域的命中范围（合并 / 剪除）：只影响鼠标命中，不重画。
-    pub fn edit_region(&self, name: &str, shape: cloudime_render::HitShape, combine: bool) {
+    pub fn edit_region(&self, name: &str, shape: cloud_ui_render::HitShape, combine: bool) {
         let mut content = self.content.borrow_mut();
         let Content::Document(document) = &mut *content else {
             tracing::warn!("窗口模板：只有脚本内容才有区域");

@@ -7,7 +7,7 @@ use cloud_ui::{
     AppEvent, AppLayout, Application, CLOSE_ACTION, Context, MessageDialog, Theme, View,
     WindowOptions, run_native,
 };
-use cloudime_render::Document;
+use cloud_ui_render::Document;
 use serde_json::json;
 
 struct Hello {

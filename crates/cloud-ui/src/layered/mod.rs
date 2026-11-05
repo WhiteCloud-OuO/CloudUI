@@ -6,7 +6,7 @@
 
 mod canvas;
 
-use cloudime_render::Pixmap;
+use cloud_ui_render::Pixmap;
 use windows::Win32::Foundation::{COLORREF, E_INVALIDARG, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HDC};
 use windows::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};

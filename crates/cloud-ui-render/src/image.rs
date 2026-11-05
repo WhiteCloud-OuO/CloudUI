@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(from_handle.pixels(), quarters().pixels());
 
         let path =
-            std::env::temp_dir().join(format!("cloudime-render-image-{}.png", std::process::id()));
+            std::env::temp_dir().join(format!("cloud-ui-render-image-{}.png", std::process::id()));
         std::fs::write(&path, &bytes).expect("写临时文件");
         let from_file = load_image(&path).expect("从文件解码");
         let _ = std::fs::remove_file(&path);

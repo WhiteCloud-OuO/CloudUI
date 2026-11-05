@@ -8,7 +8,7 @@
 //! 用户点按钮后返回；期间所有者窗口被 `EnableWindow(FALSE)` 挡住。所有者来自
 //! [`crate::current`] 的线程本地当前窗口。
 
-use cloudime_render::{Document, Element};
+use cloud_ui_render::{Document, Element};
 
 use super::blocking::{self, BlockingPanel};
 use super::layout;

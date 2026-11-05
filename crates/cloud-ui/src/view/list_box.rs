@@ -1,11 +1,11 @@
 //! 单列列表盒（子页面容器）：`View` 里的行模型与渲染参数。
 //!
-//! 行内容由这里转成 [`cloudime_render::Element`]，选中 / 悬停各带一份样式；
+//! 行内容由这里转成 [`cloud_ui_render::Element`]，选中 / 悬停各带一份样式；
 //! 行滚动、命中与滚动条仍由渲染器的 `Element::ListBox` 负责。
-//! 可点击的行把 `action` 名字写进 [`cloudime_render::Document::regions`]，
+//! 可点击的行把 `action` 名字写进 [`cloud_ui_render::Document::regions`]，
 //! 应用收到的是 `AppEvent::RegionClicked(action)`。
 
-use cloudime_render::{
+use cloud_ui_render::{
     Color, Element, FontSlot, HitRect, HitShape, ListBox, ListBoxAlign, ListBoxRow, Region,
 };
 

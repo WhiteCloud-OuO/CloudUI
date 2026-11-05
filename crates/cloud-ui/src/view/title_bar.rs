@@ -9,7 +9,7 @@
 //! 空白处由 `WindowOptions::caption_height` 交给窗口拖动。
 
 use cloud_ui_core::{Edges, Node, NodeId, NodeKind, Rect, Size, SizeSpec};
-use cloudime_render::{Color, Element, FontSlot, HitShape, WindowGlyph};
+use cloud_ui_render::{Color, Element, FontSlot, HitShape, WindowGlyph};
 
 use super::{LabelStyle, View, push_region};
 
@@ -277,7 +277,7 @@ pub(super) fn add_background(elements: &mut Vec<Element>, rect: Rect, style: &Ti
 #[allow(clippy::too_many_arguments)]
 pub(super) fn add_icon_button(
     elements: &mut Vec<Element>,
-    regions: &mut Vec<cloudime_render::Region>,
+    regions: &mut Vec<cloud_ui_render::Region>,
     rect: Rect,
     drawn: (f32, f32),
     clip: Option<Rect>,

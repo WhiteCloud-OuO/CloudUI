@@ -12,7 +12,7 @@ use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
-use cloudime_render::{Color, Document, Element};
+use cloud_ui_render::{Color, Document, Element};
 
 use super::blocking::{self, BlockingPanel};
 use super::layout;

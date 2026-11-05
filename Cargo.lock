@@ -168,8 +168,8 @@ name = "cloud-ui"
 version = "0.0.3"
 dependencies = [
  "cloud-ui-core",
+ "cloud-ui-render",
  "cloud-ui-types",
- "cloudime-render",
  "serde_json",
  "tracing",
  "windows",
@@ -181,16 +181,7 @@ name = "cloud-ui-core"
 version = "0.0.3"
 
 [[package]]
-name = "cloud-ui-types"
-version = "0.0.3"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "cloudime-render"
+name = "cloud-ui-render"
 version = "0.0.3"
 dependencies = [
  "clap",
@@ -204,6 +195,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows",
+]
+
+[[package]]
+name = "cloud-ui-types"
+version = "0.0.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

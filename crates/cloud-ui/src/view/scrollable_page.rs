@@ -2,13 +2,13 @@
 //!
 //! 容器分两类：**控件容器**（如 `panel`、本控件）与**子页面容器**；`scrollable_page`
 //! 属于控件容器，里面放任意子控件。`View` 把它们摆进一块
-//! [`cloudime_render::SelfDrawingPanel`]（`clip = true`），渲染器先画到独立画布再合成，
+//! [`cloud_ui_render::SelfDrawingPanel`]（`clip = true`），渲染器先画到独立画布再合成，
 //! 超出视口的部分自然被裁掉。行列表请用 `list_box`，那里有整行 / 均匀间隙规则。
 //! 滚动偏移由应用保存（[`ScrollablePageState`]），内容高度 / 可滚范围从
 //! [`ScrollablePageMetrics`] 读。
 
 use cloud_ui_core::{Edges, Rect};
-use cloudime_render::{Color, Element, SelfDrawingPanel};
+use cloud_ui_render::{Color, Element, SelfDrawingPanel};
 
 /// 可滚动页面的外观参数（点）。
 #[derive(Debug, Clone, Copy)]

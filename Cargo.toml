@@ -3,7 +3,7 @@ resolver = "3"
 members = [
     "crates/cloud-ui-core",
     "crates/cloud-ui-types",
-    "crates/cloudime-render",
+    "crates/cloud-ui-render",
     "crates/cloud-ui",
 ]
 
@@ -19,7 +19,7 @@ all = "warn"
 # 内部 crate
 cloud-ui-core = { path = "crates/cloud-ui-core" }
 cloud-ui-types = { path = "crates/cloud-ui-types" }
-cloudime-render = { path = "crates/cloudime-render" }
+cloud-ui-render = { path = "crates/cloud-ui-render" }
 
 # 外部依赖统一在这里定版本，子 crate 只写 `xxx.workspace = true`
 serde = { version = "1.0.229", features = ["derive"] }

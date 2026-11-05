@@ -1,5 +1,5 @@
-﻿[package]
-name = "cloudime-render"
+[package]
+name = "cloud-ui-render"
 description = "自绘渲染器：把一帧画成位图，壳只负责贴图"
 version.workspace = true
 edition.workspace = true

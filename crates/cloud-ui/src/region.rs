@@ -3,7 +3,7 @@
 //! 区域只管命中与拖拽开关，不负责画（画的是元素）：悬浮工具栏的每个图标、脚本窗口里的按钮，
 //! 都是把「画出来的东西」放进一个区域里。坐标单位跟内容一致（脚本窗口是点、状态条是像素）。
 
-use cloudime_render::Region;
+use cloud_ui_render::Region;
 
 /// 按内容坐标找最上面那个区域（后写的盖住先写的，与元素绘制顺序一致）。
 pub(super) fn hit(regions: &[Region], x: f32, y: f32) -> Option<usize> {
@@ -18,7 +18,7 @@ pub(super) fn hit(regions: &[Region], x: f32, y: f32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cloudime_render::{HitRect, HitShape};
+    use cloud_ui_render::{HitRect, HitShape};
 
     fn rect(name: &str, x: f32, y: f32, width: f32, height: f32) -> Region {
         Region::new(

@@ -1,4 +1,4 @@
-//! 离线预览：`cargo run --release -p cloudime-render --example preview -- --out target/render-preview`
+//! 离线预览：`cargo run --release -p cloud-ui-render --example preview -- --out target/render-preview`
 //! 把样例帧按竖 / 横排画成 PNG，与系统候选窗截图并排比；`--measure` 只量几段文字的宽度与原生对数；
 //! 末尾列出验收行每个字形落到了哪家字体。不是日常工具，改渲染器时拿来核对。
 
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
-use cloudime_render::{
+use cloud_ui_render::{
     Auxiliary, FontLibrary, Frame, KeyCap, KeyMapLayout, Layout, Preedit, PreeditSegment,
     PreeditStyle, Renderer, Row, Shadow, StatusCell, Theme, TipSegment, Tone, key_map_cell,
 };
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cloudime_render=debug".into()),
+                .unwrap_or_else(|_| "cloud_ui_render=debug".into()),
         )
         .init();
     let args = Args::parse();

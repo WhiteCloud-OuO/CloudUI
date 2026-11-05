@@ -1,7 +1,7 @@
 //! 无 Lua 的 view / widget / 布局构建层。
 //!
 //! 这是独立 exe 的“应用 UI”入口：用 `View` 搭一棵简单的控件树，`build` 时先走
-//! [`cloud_ui_core`] 的 measure-arrange，再转成 [`cloudime_render::Document`]。
+//! [`cloud_ui_core`] 的 measure-arrange，再转成 [`cloud_ui_render::Document`]。
 //! 现有 IME 路径继续用 `cloudime-script` 的页面树 JSON，两者共用同一个布局核心与渲染器。
 //!
 //! ```ignore
@@ -19,7 +19,7 @@ use cloud_ui_core::{
     Align, Axis, Constraints, Edges, Justify, LayoutResult, LayoutSpec, Measure, Node, NodeId,
     NodeKind, PageTree, Rect, Size, SizeSpec, layout,
 };
-use cloudime_render::{Color, Document, Element, FontSlot, HitShape, Region, WindowGlyph};
+use cloud_ui_render::{Color, Document, Element, FontSlot, HitShape, Region, WindowGlyph};
 
 mod list_box;
 mod scrollable_page;
@@ -749,7 +749,7 @@ fn push_region(
 
 fn shift_shape(shape: HitShape, (dx, dy): (f32, f32)) -> HitShape {
     match shape {
-        HitShape::Rect(rect) => HitShape::Rect(cloudime_render::HitRect::new(
+        HitShape::Rect(rect) => HitShape::Rect(cloud_ui_render::HitRect::new(
             rect.x + dx,
             rect.y + dy,
             rect.width,
@@ -802,7 +802,7 @@ fn clip_shape(shape: HitShape, clip: Option<Rect>) -> Option<HitShape> {
             let right = (rect.x + rect.width).min(clip.right());
             let bottom = (rect.y + rect.height).min(clip.bottom());
             (right > x && bottom > y)
-                .then(|| HitShape::Rect(cloudime_render::HitRect::new(x, y, right - x, bottom - y)))
+                .then(|| HitShape::Rect(cloud_ui_render::HitRect::new(x, y, right - x, bottom - y)))
         }
         HitShape::RoundRect {
             x,

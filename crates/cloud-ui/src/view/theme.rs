@@ -3,7 +3,7 @@
 //! 主题只影响 `View` 生成的控件；IME 那套候选窗 / 状态条主题仍是
 //! `cloudime-platform` 的 `ThemeFile`，两者互不替换。
 
-use cloudime_render::{Color, FontSlot};
+use cloud_ui_render::{Color, FontSlot};
 
 use super::{
     ButtonStyle, IconButtonStyle, LabelStyle, ListBoxStyle, PanelStyle, ScrollablePageStyle,

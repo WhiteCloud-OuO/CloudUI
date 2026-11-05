@@ -13,9 +13,9 @@
 //!         for event in ctx.events() { /* 处理输入 */ }
 //!     }
 //!
-//!     fn view(&mut self, ctx: &Context) -> cloudime_render::Document {
+//!     fn view(&mut self, ctx: &Context) -> cloud_ui_render::Document {
 //!         let (width, height) = ctx.size();
-//!         cloudime_render::Document::empty(width, height)
+//!         cloud_ui_render::Document::empty(width, height)
 //!     }
 //! }
 //!
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use cloudime_render::{Color, Document, Element, FontSlot, Pixmap, Region, Shadow, TextBoxScroll};
+use cloud_ui_render::{Color, Document, Element, FontSlot, Pixmap, Region, Shadow, TextBoxScroll};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, ClientToScreen, DIB_RGB_COLORS, EndPaint,

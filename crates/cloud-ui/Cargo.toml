@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "cloud-ui"
 description = "Windows 自绘窗口壳：分层窗口、辅助窗口、内置对话框与 RichEdit 宿主"
 version.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 cloud-ui-core.workspace = true
 cloud-ui-types.workspace = true
-cloudime-render.workspace = true
+cloud-ui-render.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 

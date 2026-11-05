@@ -17,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, TranslateMessage, WM_APP,
 };
 
-use cloudime_render::Document;
+use cloud_ui_render::Document;
 
 use crate::auxiliary_window_template::{
     AuxiliaryWindowTemplate, DialogOptions, PanelAction, PanelEvent,

@@ -13,7 +13,7 @@ Windows 专用的自绘 UI 库。本仓库同时存放设计文档与可独立�
 crates/
   cloud-ui-core      页面树、布局约束与尺寸（无 Windows 依赖）
   cloud-ui-types     轻量 UI 数据类型（排布、序号样式、主题）
-  cloudime-render    自绘渲染器：Document -> 位图
+  cloud-ui-render    自绘渲染器：Document -> 位图
   cloud-ui           窗口壳、应用宿主、控件层、文本编辑、内置对话框
   cloud-ui/examples  hello.json（前端界面）+ hello.rs（后端逻辑）
 Images/SVG/          自绘标题栏使用的 SVG 图标
